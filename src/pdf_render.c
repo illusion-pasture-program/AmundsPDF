@@ -885,7 +885,17 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
     int font_height_px = -(int)(font_size * eff_scale + 0.5);
     if (font_height_px == 0) font_height_px = -12;
 
-    HFONT hfont = pdf_font_create_px(base_font, font_height_px);
+    /* Extract rotation angle from the combined matrix.
+     * In PDF, the text matrix maps text space -> user space, then CTM maps to device.
+     * The combined matrix's a,b components give the direction of the x-axis in device space.
+     * atan2(-b, a) gives the GDI rotation angle (GDI Y-axis is flipped vs math convention).
+     * Note: GDI escapement is counter-clockwise in tenths of degrees. */
+    double rotation_rad = atan2(-font_mtx.b, font_mtx.a);
+    int rotation_deg = (int)(rotation_rad * 180.0 / 3.14159265358979323846 + 0.5);
+    /* Normalize to [0, 360) */
+    rotation_deg = ((rotation_deg % 360) + 360) % 360;
+
+    HFONT hfont = pdf_font_create_px(base_font, font_height_px, rotation_deg);
     if (!hfont) return;
 
     HFONT old_font = (HFONT)SelectObject(hdc, hfont);

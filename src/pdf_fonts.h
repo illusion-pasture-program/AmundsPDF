@@ -1,12 +1,15 @@
 /*
  * AmundsPDF - pdf_fonts.h
- * Font system: standard 14 font metrics, PDF-to-Windows font mapping.
+ * Font system: standard 14 font metrics, PDF-to-Windows font mapping,
+ * and embedded font loading via AddFontMemResourceEx.
  * Zero external dependencies beyond standard C + Win32.
  */
 #ifndef PDF_FONTS_H
 #define PDF_FONTS_H
 
 #include "pdf_types.h"
+
+/* Forward declaration - PdfDocument is defined in pdf_types.h */
 
 /*
  * pdf_font_create - Map a PDF /BaseFont name to a Windows HFONT.
@@ -27,10 +30,12 @@ HFONT pdf_font_create(const char *base_font_name, double size_pt, HDC hdc);
  * Use this when the caller has already computed the device-space font size
  * (e.g., by scaling through the CTM). Bypasses DPI conversion.
  *
- * height_px: font height in device pixels (positive = cell height, negative = character height).
+ * height_px:    font height in device pixels (positive = cell height, negative = character height).
+ * rotation_deg: rotation angle in degrees (counter-clockwise). Used for rotated text
+ *               rendering via GDI lfEscapement/lfOrientation. Pass 0 for no rotation.
  * Returns NULL on failure. Caller must DeleteObject() when done.
  */
-HFONT pdf_font_create_px(const char *base_font_name, int height_px);
+HFONT pdf_font_create_px(const char *base_font_name, int height_px, int rotation_deg);
 
 /*
  * pdf_fonts_cleanup - Free any internally cached font resources.
@@ -56,5 +61,27 @@ int pdf_font_char_width(const char *base_font_name, int char_code);
  * Returns the default character width in 1/1000 of a text space unit.
  */
 int pdf_font_default_width(const char *base_font_name);
+
+/* ─── Embedded Font Support ─── */
+
+/*
+ * pdf_font_try_load_embedded - Attempt to load an embedded font from the PDF.
+ *
+ * Looks up the font resource dictionary for the given resource name (e.g., "F1"),
+ * finds the /FontDescriptor, extracts /FontFile2 (TrueType) or /FontFile3
+ * (/OpenType subtype) stream data, and loads it via AddFontMemResourceEx.
+ *
+ * On success, writes the resolved family name into out_family_name and returns true.
+ * The font remains loaded until pdf_fonts_cleanup() is called.
+ *
+ * font_res_name: the resource name from the Tf operator (e.g., "F1")
+ * resources:     the page's /Resources dictionary
+ * doc:           the PDF document for resolving references and decoding streams
+ * out_family_name: buffer to receive the resolved font family name
+ * name_len:      size of out_family_name buffer
+ */
+bool pdf_font_try_load_embedded(PdfDocument *doc, PdfDict *resources,
+                                 const char *font_res_name,
+                                 char *out_family_name, int name_len);
 
 #endif /* PDF_FONTS_H */

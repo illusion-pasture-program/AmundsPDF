@@ -1,15 +1,18 @@
 /*
  * AmundsPDF - pdf_fonts.c
- * Standard 14 PDF font metrics and Windows system font mapping.
+ * Standard 14 PDF font metrics, Windows system font mapping,
+ * and embedded font loading via AddFontMemResourceEx.
  *
  * Provides:
  *   - Mapping from PDF /BaseFont names to Win32 HFONT objects
  *   - Character width tables for Helvetica, Times-Roman, and Courier
  *     (WinAnsiEncoding, 256 entries, units of 1/1000 text space)
  *   - Heuristic fallback for non-standard font names
+ *   - Loading of embedded TrueType/OpenType fonts from PDF streams
  */
 
 #include "pdf_fonts.h"
+#include "pdf_parser.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Standard 14 Font Mapping Table
@@ -437,7 +440,7 @@ HFONT pdf_font_create(const char *base_font_name, double size_pt, HDC hdc)
     return CreateFontIndirectW(&lf);
 }
 
-HFONT pdf_font_create_px(const char *base_font_name, int height_px)
+HFONT pdf_font_create_px(const char *base_font_name, int height_px, int rotation_deg)
 {
     const char *win_family = "Arial";
     int weight = FW_NORMAL;
@@ -486,9 +489,14 @@ HFONT pdf_font_create_px(const char *base_font_name, int height_px)
         wfamily[i] = (wchar_t)(unsigned char)win_family[i];
     wfamily[i] = L'\0';
 
+    /* GDI escapement is in tenths of a degree */
+    int escapement = rotation_deg * 10;
+
     LOGFONTW lf;
     memset(&lf, 0, sizeof(lf));
     lf.lfHeight         = height_px;
+    lf.lfEscapement     = escapement;
+    lf.lfOrientation    = escapement;
     lf.lfWeight         = weight;
     lf.lfItalic         = italic;
     lf.lfCharSet        = charset;
