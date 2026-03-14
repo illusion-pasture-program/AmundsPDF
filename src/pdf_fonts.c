@@ -736,10 +736,13 @@ static int search_descriptor_for_font_stream(PdfDocument *doc, PdfDict *descript
         if (strcmp(font_file_keys[k], "FontFile3") == 0) {
             const char *subtype = pdf_dict_get_name(resolved->stream->dict, "Subtype");
             if (subtype && strcmp(subtype, "Type1C") == 0) {
-                /* Type1C (bare CFF) - needs OpenType wrapping */
-                *out_is_type1c = true;
+                /* Type1C (bare CFF) - skip for now.
+                 * CFF subset data uses custom encoding/charset that doesn't
+                 * map correctly when loaded via AddFontMemResourceEx, even
+                 * when wrapped in an OpenType container. */
+                continue;
             }
-            /* OpenType, CIDFontType0C, Type1C are all accepted */
+            /* OpenType or CIDFontType0C are OK */
         }
 
         *out_stream_obj = resolved;
@@ -859,6 +862,154 @@ static uint32_t otf_checksum(const uint8_t *data, size_t len)
 }
 
 /*
+ * Skip a CFF INDEX structure and return the position after it.
+ * Also optionally return the count and the data start/end for the first entry.
+ */
+static size_t cff_skip_index(const uint8_t *cff, size_t cff_len, size_t pos,
+                               uint16_t *out_count)
+{
+    if (pos + 2 > cff_len) return cff_len;
+    uint16_t count = read_u16_be(cff + pos);
+    if (out_count) *out_count = count;
+    if (count == 0) return pos + 2;
+
+    uint8_t offSize = cff[pos + 2];
+    if (offSize < 1 || offSize > 4) return cff_len;
+
+    size_t idx_end = pos + 3 + (size_t)(count + 1) * offSize;
+    if (idx_end > cff_len) return cff_len;
+
+    /* Read the last offset to find total data size */
+    uint32_t last_offset = 0;
+    const uint8_t *p = cff + pos + 3 + (size_t)count * offSize;
+    for (int i = 0; i < offSize; i++)
+        last_offset = (last_offset << 8) | p[i];
+
+    return idx_end + last_offset - 1;
+}
+
+/*
+ * Read a CFF INDEX entry's raw data.
+ * Returns pointer to data and sets *out_len. Returns NULL on error.
+ */
+static const uint8_t *cff_index_entry(const uint8_t *cff, size_t cff_len,
+                                        size_t pos, int entry_idx, size_t *out_len)
+{
+    *out_len = 0;
+    if (pos + 2 > cff_len) return NULL;
+    uint16_t count = read_u16_be(cff + pos);
+    if (entry_idx >= count) return NULL;
+
+    uint8_t offSize = cff[pos + 2];
+    if (offSize < 1 || offSize > 4) return NULL;
+
+    /* Read offset[entry_idx] and offset[entry_idx+1] */
+    uint32_t off_start = 0, off_end = 0;
+    const uint8_t *p1 = cff + pos + 3 + (size_t)entry_idx * offSize;
+    const uint8_t *p2 = p1 + offSize;
+    for (int i = 0; i < offSize; i++) {
+        off_start = (off_start << 8) | p1[i];
+        off_end = (off_end << 8) | p2[i];
+    }
+
+    size_t data_start = pos + 3 + (size_t)(count + 1) * offSize;
+    *out_len = off_end - off_start;
+    return cff + data_start + off_start - 1;
+}
+
+/*
+ * Parse a CFF Top Dict to find the CharStrings offset.
+ * Returns the offset within the CFF data, or 0 on failure.
+ */
+static uint32_t cff_parse_charstrings_offset(const uint8_t *dict_data, size_t dict_len)
+{
+    size_t pos = 0;
+    int32_t operands[16];
+    int op_count = 0;
+
+    while (pos < dict_len) {
+        uint8_t b0 = dict_data[pos];
+
+        if (b0 <= 21) {
+            /* Operator */
+            int op;
+            if (b0 == 12 && pos + 1 < dict_len) {
+                op = 1200 + dict_data[pos + 1]; /* encode as 12xx */
+                pos += 2;
+            } else {
+                op = b0;
+                pos += 1;
+            }
+
+            /* CharStrings operator = 17 */
+            if (op == 17 && op_count > 0) {
+                return (uint32_t)operands[op_count - 1];
+            }
+            op_count = 0;
+        } else if (b0 == 28 && pos + 2 < dict_len) {
+            int16_t val = (int16_t)read_u16_be(dict_data + pos + 1);
+            if (op_count < 16) operands[op_count++] = val;
+            pos += 3;
+        } else if (b0 == 29 && pos + 4 < dict_len) {
+            int32_t val = (int32_t)read_u32_be(dict_data + pos + 1);
+            if (op_count < 16) operands[op_count++] = val;
+            pos += 5;
+        } else if (b0 == 30) {
+            /* Real number (nibble-encoded) - skip */
+            pos++;
+            while (pos < dict_len) {
+                uint8_t b = dict_data[pos++];
+                if ((b & 0x0F) == 0x0F || (b >> 4) == 0x0F) break;
+            }
+            if (op_count < 16) operands[op_count++] = 0; /* placeholder */
+        } else if (b0 >= 32 && b0 <= 246) {
+            if (op_count < 16) operands[op_count++] = (int32_t)b0 - 139;
+            pos += 1;
+        } else if (b0 >= 247 && b0 <= 250 && pos + 1 < dict_len) {
+            uint8_t b1 = dict_data[pos + 1];
+            if (op_count < 16) operands[op_count++] = ((int32_t)b0 - 247) * 256 + b1 + 108;
+            pos += 2;
+        } else if (b0 >= 251 && b0 <= 254 && pos + 1 < dict_len) {
+            uint8_t b1 = dict_data[pos + 1];
+            if (op_count < 16) operands[op_count++] = -((int32_t)b0 - 251) * 256 - b1 - 108;
+            pos += 2;
+        } else {
+            pos++;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Get the number of glyphs in a CFF font by parsing its CharStrings INDEX.
+ * Returns the glyph count, or 1 on failure (fallback minimum).
+ */
+static uint16_t cff_get_glyph_count(const uint8_t *cff, size_t cff_len)
+{
+    if (cff_len < 4) return 1;
+
+    /* CFF header */
+    uint8_t hdr_size = cff[2];
+    if (hdr_size < 4) hdr_size = 4;
+
+    /* Skip Name INDEX */
+    size_t pos = cff_skip_index(cff, cff_len, hdr_size, NULL);
+
+    /* Read Top Dict INDEX - need entry 0 */
+    size_t dict_data_len = 0;
+    const uint8_t *dict_data = cff_index_entry(cff, cff_len, pos, 0, &dict_data_len);
+    if (!dict_data || dict_data_len == 0) return 1;
+
+    /* Parse Top Dict to find CharStrings offset */
+    uint32_t cs_offset = cff_parse_charstrings_offset(dict_data, dict_data_len);
+    if (cs_offset == 0 || cs_offset + 2 > cff_len) return 1;
+
+    /* Read the CharStrings INDEX count */
+    uint16_t count = read_u16_be(cff + cs_offset);
+    return count > 0 ? count : 1;
+}
+
+/*
  * Wrap bare CFF data in a minimal OpenType container.
  * Returns a malloc'd buffer containing the OTF file, and sets *out_len.
  * Caller must free() the returned buffer.
@@ -873,6 +1024,9 @@ static uint8_t *wrap_cff_in_otf(const uint8_t *cff_data, size_t cff_len,
     *out_len = 0;
     size_t name_len_bytes = strlen(font_name);
     if (name_len_bytes > 127) name_len_bytes = 127;
+
+    /* Get the actual glyph count from the CFF data */
+    uint16_t num_glyphs = cff_get_glyph_count(cff_data, cff_len);
 
     /* We need 8 tables: CFF, OS/2, cmap, head, hhea, maxp, name, post */
     const int num_tables = 8;
@@ -898,12 +1052,12 @@ static uint8_t *wrap_cff_in_otf(const uint8_t *cff_data, size_t cff_len,
     write_u16_be(hhea_tbl + 4, 800);
     write_u16_be(hhea_tbl + 6, (uint16_t)(int16_t)-200);
     write_u16_be(hhea_tbl + 10, 1000);
-    write_u16_be(hhea_tbl + 34, 1);
+    write_u16_be(hhea_tbl + 34, num_glyphs);   /* numOfLongHorMetrics = numGlyphs */
 
     /* 3. maxp table (6 bytes for CFF) */
     uint8_t maxp_tbl[6];
     write_u32_be(maxp_tbl + 0, 0x00005000);
-    write_u16_be(maxp_tbl + 4, 1);
+    write_u16_be(maxp_tbl + 4, num_glyphs);    /* actual glyph count from CFF */
 
     /* 4. OS/2 table (78 bytes) */
     uint8_t os2_tbl[78];
@@ -985,11 +1139,24 @@ static uint8_t *wrap_cff_in_otf(const uint8_t *cff_data, size_t cff_len,
     write_u16_be(post_tbl + 8, (uint16_t)(int16_t)-100);
     write_u16_be(post_tbl + 10, 50);
 
-    /* 8. CFF table = raw CFF data */
+    /* 8. hmtx table - horizontal metrics for each glyph.
+     * Each longHorMetric entry is 4 bytes: uint16 advanceWidth, int16 lsb.
+     * We use a default advance width of 500 for all glyphs. */
+    size_t hmtx_size = (size_t)num_glyphs * 4;
+    size_t hmtx_padded = (hmtx_size + 3) & ~3;
+    uint8_t *hmtx_tbl = (uint8_t *)calloc(1, hmtx_padded);
+    if (!hmtx_tbl) { free(name_tbl); return NULL; }
+    for (int i = 0; i < num_glyphs; i++) {
+        write_u16_be(hmtx_tbl + i * 4, 500);   /* advanceWidth */
+        write_u16_be(hmtx_tbl + i * 4 + 2, 0); /* lsb */
+    }
+
+    /* 9. CFF table = raw CFF data */
     size_t cff_padded = (cff_len + 3) & ~3;
 
-    /* Assemble the OTF */
-    size_t hdr_size = 12 + num_tables * 16;
+    /* Assemble the OTF with 9 tables */
+    const int actual_num_tables = 9;
+    size_t hdr_size = 12 + actual_num_tables * 16;
     size_t head_pad = (sizeof(head_tbl) + 3) & ~3;
     size_t hhea_pad = (sizeof(hhea_tbl) + 3) & ~3;
     size_t maxp_pad = (sizeof(maxp_tbl) + 3) & ~3;
@@ -998,34 +1165,35 @@ static uint8_t *wrap_cff_in_otf(const uint8_t *cff_data, size_t cff_len,
     size_t post_pad = (sizeof(post_tbl) + 3) & ~3;
 
     size_t total = hdr_size + cff_padded + os2_pad + cmap_pad + head_pad +
-                   hhea_pad + maxp_pad + name_tbl_padded + post_pad;
+                   hhea_pad + hmtx_padded + maxp_pad + name_tbl_padded + post_pad;
 
     uint8_t *otf = (uint8_t *)calloc(1, total);
-    if (!otf) { free(name_tbl); return NULL; }
+    if (!otf) { free(name_tbl); free(hmtx_tbl); return NULL; }
 
     /* OTF header */
     write_u32_be(otf, 0x4F54544F);  /* 'OTTO' */
-    write_u16_be(otf + 4, num_tables);
+    write_u16_be(otf + 4, actual_num_tables);
     int sr = 1, es = 0;
-    while (sr * 2 <= num_tables) { sr *= 2; es++; }
+    while (sr * 2 <= actual_num_tables) { sr *= 2; es++; }
     write_u16_be(otf + 6, sr * 16);
     write_u16_be(otf + 8, es);
-    write_u16_be(otf + 10, num_tables * 16 - sr * 16);
+    write_u16_be(otf + 10, actual_num_tables * 16 - sr * 16);
 
     /* Table directory (sorted by tag for spec compliance) */
-    struct { uint32_t tag; const uint8_t *data; size_t len; size_t pad; } tbls[8] = {
+    struct { uint32_t tag; const uint8_t *data; size_t len; size_t pad; } tbls[9] = {
         { 0x43464620, cff_data,   cff_len,         cff_padded },        /* CFF  */
         { 0x4F532F32, os2_tbl,    sizeof(os2_tbl),  os2_pad },          /* OS/2 */
         { 0x636D6170, cmap_tbl,   sizeof(cmap_tbl), cmap_pad },         /* cmap */
         { 0x68656164, head_tbl,   sizeof(head_tbl), head_pad },         /* head */
         { 0x68686561, hhea_tbl,   sizeof(hhea_tbl), hhea_pad },         /* hhea */
+        { 0x686D7478, hmtx_tbl,   hmtx_size,        hmtx_padded },      /* hmtx */
         { 0x6D617870, maxp_tbl,   sizeof(maxp_tbl), maxp_pad },         /* maxp */
         { 0x6E616D65, name_tbl,   name_tbl_size,    name_tbl_padded },  /* name */
         { 0x706F7374, post_tbl,   sizeof(post_tbl), post_pad },         /* post */
     };
 
     size_t offset = hdr_size;
-    for (int i = 0; i < num_tables; i++) {
+    for (int i = 0; i < actual_num_tables; i++) {
         uint8_t *rp = otf + 12 + i * 16;
         write_u32_be(rp, tbls[i].tag);
         write_u32_be(rp + 4, otf_checksum(tbls[i].data, tbls[i].len));
@@ -1036,8 +1204,310 @@ static uint8_t *wrap_cff_in_otf(const uint8_t *cff_data, size_t cff_len,
     }
 
     free(name_tbl);
+    free(hmtx_tbl);
     *out_len = total;
     return otf;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * TrueType Font Patching
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * PDF subset TrueType fonts often lack the 'cmap' and 'post' tables that
+ * Windows GDI requires for AddFontMemResourceEx. They may also have the
+ * subset prefix (e.g., "ABCDEF+") in their name table entries.
+ *
+ * This function creates a patched copy of the font with:
+ * - A minimal 'cmap' table (format 4, identity mapping for Latin range)
+ * - A minimal 'post' table (format 3.0)
+ * - Name table entries with subset prefix stripped
+ */
+
+/*
+ * Check if a TrueType font has a specific table.
+ */
+static bool ttf_has_table(const uint8_t *data, size_t len, const char *tag_str)
+{
+    if (len < 12) return false;
+    uint16_t num_tables = read_u16_be(data + 4);
+    if (len < 12 + (size_t)num_tables * 16) return false;
+
+    uint32_t tag = ((uint32_t)(uint8_t)tag_str[0] << 24) |
+                   ((uint32_t)(uint8_t)tag_str[1] << 16) |
+                   ((uint32_t)(uint8_t)tag_str[2] << 8) |
+                   (uint32_t)(uint8_t)tag_str[3];
+
+    for (int i = 0; i < num_tables; i++) {
+        uint32_t t = read_u32_be(data + 12 + i * 16);
+        if (t == tag) return true;
+    }
+    return false;
+}
+
+/*
+ * Patch a TrueType font to add missing cmap/post tables and fix names.
+ *
+ * Returns a malloc'd buffer with the patched font, and sets *out_len.
+ * If no patching is needed, returns NULL (caller should use original data).
+ * Caller must free() the returned buffer.
+ */
+static uint8_t *ttf_patch_for_gdi(const uint8_t *font_data, size_t font_data_len,
+                                    const char *clean_name, size_t *out_len)
+{
+    *out_len = 0;
+    if (font_data_len < 12) return NULL;
+
+    bool needs_cmap = !ttf_has_table(font_data, font_data_len, "cmap");
+    bool needs_post = !ttf_has_table(font_data, font_data_len, "post");
+    /* Check if the name has a subset prefix (contains '+') */
+    bool needs_name_fix = (clean_name != NULL && strchr(clean_name, '+') == NULL);
+    /* Actually check if the font data name table contains a '+' */
+    needs_name_fix = false; /* will detect below */
+
+    /* Scan the name table for subset prefix */
+    if (font_data_len >= 12) {
+        uint16_t nt = read_u16_be(font_data + 4);
+        for (int i = 0; i < nt && 12 + (size_t)i * 16 + 16 <= font_data_len; i++) {
+            uint32_t tag = read_u32_be(font_data + 12 + i * 16);
+            if (tag == 0x6E616D65) { /* 'name' */
+                uint32_t name_off = read_u32_be(font_data + 12 + i * 16 + 8);
+                uint32_t name_len_tbl = read_u32_be(font_data + 12 + i * 16 + 12);
+                if (name_off + 6 <= font_data_len && name_len_tbl > 6) {
+                    uint16_t nc = read_u16_be(font_data + name_off + 2);
+                    uint16_t so = read_u16_be(font_data + name_off + 4);
+                    for (int j = 0; j < nc && 6 + (size_t)j * 12 + 12 <= name_len_tbl; j++) {
+                        const uint8_t *nr2 = font_data + name_off + 6 + j * 12;
+                        uint16_t nid = read_u16_be(nr2 + 6);
+                        uint16_t slen = read_u16_be(nr2 + 8);
+                        uint16_t soff = read_u16_be(nr2 + 10);
+                        if ((nid == 1 || nid == 4 || nid == 6) && slen > 14) {
+                            size_t abs_off = name_off + so + soff;
+                            if (abs_off + slen <= font_data_len) {
+                                /* Check for '+' in the string (ASCII or UTF-16BE) */
+                                for (size_t k = 0; k < slen; k++) {
+                                    if (font_data[abs_off + k] == '+') {
+                                        needs_name_fix = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if (needs_name_fix) break;
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    if (!needs_cmap && !needs_post && !needs_name_fix)
+        return NULL; /* No patching needed */
+
+    uint16_t orig_num_tables = read_u16_be(font_data + 4);
+    int extra_tables = (needs_cmap ? 1 : 0) + (needs_post ? 1 : 0);
+    uint16_t new_num_tables = orig_num_tables + extra_tables;
+
+    /* Build the minimal cmap table (format 4, ASCII/Latin identity mapping).
+     * segCount = 2 (one segment 0x0020..0x00FF + sentinel 0xFFFF).
+     * Format 4 subtable = 14 byte header + 4 arrays of 2 entries each (18 bytes) = 32 bytes.
+     * cmap header = 12 bytes. Total = 44 bytes. */
+    uint8_t cmap_data[44];
+    memset(cmap_data, 0, sizeof(cmap_data));
+    /* cmap header */
+    write_u16_be(cmap_data + 0, 0);        /* version */
+    write_u16_be(cmap_data + 2, 1);        /* numTables */
+    write_u16_be(cmap_data + 4, 3);        /* platformID: Windows */
+    write_u16_be(cmap_data + 6, 1);        /* encodingID: Unicode BMP */
+    write_u32_be(cmap_data + 8, 12);       /* offset to subtable */
+    /* Format 4 subtable (32 bytes) */
+    write_u16_be(cmap_data + 12, 4);       /* format */
+    write_u16_be(cmap_data + 14, 32);      /* length of subtable */
+    write_u16_be(cmap_data + 16, 0);       /* language */
+    write_u16_be(cmap_data + 18, 4);       /* segCountX2 (2 segments) */
+    write_u16_be(cmap_data + 20, 4);       /* searchRange */
+    write_u16_be(cmap_data + 22, 1);       /* entrySelector */
+    write_u16_be(cmap_data + 24, 0);       /* rangeShift */
+    /* endCode[2] */
+    write_u16_be(cmap_data + 26, 0x00FF);  /* endCode[0]: 0xFF */
+    write_u16_be(cmap_data + 28, 0xFFFF);  /* endCode[1]: sentinel */
+    /* reservedPad */
+    write_u16_be(cmap_data + 30, 0);
+    /* startCode[2] */
+    write_u16_be(cmap_data + 32, 0x0020);  /* startCode[0]: space */
+    write_u16_be(cmap_data + 34, 0xFFFF);  /* startCode[1]: sentinel */
+    /* idDelta[2] - identity mapping: delta=0 means GID = charCode */
+    write_u16_be(cmap_data + 36, 0);       /* idDelta[0]: 0 */
+    write_u16_be(cmap_data + 38, 1);       /* idDelta[1]: 1 */
+    /* idRangeOffset[2] */
+    write_u16_be(cmap_data + 40, 0);       /* idRangeOffset[0]: 0 (use delta) */
+    write_u16_be(cmap_data + 42, 0);       /* idRangeOffset[1]: 0 */
+    size_t cmap_size = sizeof(cmap_data);
+    size_t cmap_padded = (cmap_size + 3) & ~3;
+
+    /* Build the minimal post table (format 3.0, 32 bytes) */
+    uint8_t post_data[32];
+    memset(post_data, 0, sizeof(post_data));
+    write_u32_be(post_data + 0, 0x00030000); /* format 3.0 */
+    /* italicAngle at 4: 0 */
+    write_u16_be(post_data + 8, (uint16_t)(int16_t)-100); /* underlinePosition */
+    write_u16_be(post_data + 10, 50);        /* underlineThickness */
+    /* isFixedPitch at 12: 0 */
+    size_t post_size = sizeof(post_data);
+    size_t post_padded = (post_size + 3) & ~3;
+
+    /* Calculate the original table data end (find max offset+length) */
+    size_t orig_data_end = 12 + (size_t)orig_num_tables * 16;
+    for (int i = 0; i < orig_num_tables; i++) {
+        uint32_t toff = read_u32_be(font_data + 12 + i * 16 + 8);
+        uint32_t tlen = read_u32_be(font_data + 12 + i * 16 + 12);
+        size_t end = toff + ((tlen + 3) & ~3);
+        if (end > orig_data_end) orig_data_end = end;
+    }
+
+    /* New header is larger due to extra table directory entries */
+    size_t new_header_size = 12 + (size_t)new_num_tables * 16;
+    size_t header_growth = (size_t)extra_tables * 16;
+
+    /* Total new size */
+    size_t new_total = new_header_size;
+    /* Original tables shifted by header_growth */
+    for (int i = 0; i < orig_num_tables; i++) {
+        uint32_t toff = read_u32_be(font_data + 12 + i * 16 + 8);
+        uint32_t tlen = read_u32_be(font_data + 12 + i * 16 + 12);
+        size_t new_end = toff + header_growth + ((tlen + 3) & ~3);
+        if (new_end > new_total) new_total = new_end;
+    }
+    /* Add new tables at the end */
+    if (needs_cmap) new_total += cmap_padded;
+    if (needs_post) new_total += post_padded;
+
+    uint8_t *result = (uint8_t *)calloc(1, new_total);
+    if (!result) return NULL;
+
+    /* Copy the header: sfVersion, numTables, searchRange, entrySelector, rangeShift */
+    memcpy(result, font_data, 4); /* sfVersion */
+    write_u16_be(result + 4, new_num_tables);
+    int sr = 1, es_val = 0;
+    while (sr * 2 <= new_num_tables) { sr *= 2; es_val++; }
+    write_u16_be(result + 6, sr * 16);
+    write_u16_be(result + 8, es_val);
+    write_u16_be(result + 10, new_num_tables * 16 - sr * 16);
+
+    /* Copy original table directory entries with adjusted offsets */
+    for (int i = 0; i < orig_num_tables; i++) {
+        const uint8_t *src_rec = font_data + 12 + i * 16;
+        uint8_t *dst_rec = result + 12 + i * 16;
+        memcpy(dst_rec, src_rec, 16);
+        /* Adjust the offset */
+        uint32_t orig_off = read_u32_be(src_rec + 8);
+        write_u32_be(dst_rec + 8, orig_off + (uint32_t)header_growth);
+    }
+
+    /* Copy all original table data with the shift */
+    for (int i = 0; i < orig_num_tables; i++) {
+        uint32_t orig_off = read_u32_be(font_data + 12 + i * 16 + 8);
+        uint32_t tlen = read_u32_be(font_data + 12 + i * 16 + 12);
+        uint32_t new_off = orig_off + (uint32_t)header_growth;
+        if (orig_off + tlen <= font_data_len && new_off + tlen <= new_total) {
+            memcpy(result + new_off, font_data + orig_off, tlen);
+        }
+    }
+
+    /* Fix the name table: strip subset prefix (e.g., "ABCDEF+") from name entries.
+     * We do this in-place since the stripped name is shorter - we just adjust
+     * the offset and length fields in the name records. */
+    if (needs_name_fix) {
+        for (int i = 0; i < orig_num_tables; i++) {
+            uint32_t tag = read_u32_be(result + 12 + i * 16);
+            if (tag != 0x6E616D65) continue; /* 'name' */
+
+            uint32_t tbl_off = read_u32_be(result + 12 + i * 16 + 8);
+            uint32_t tbl_len_val = read_u32_be(result + 12 + i * 16 + 12);
+            if (tbl_off + 6 > new_total) break;
+
+            uint16_t nc = read_u16_be(result + tbl_off + 2);
+            uint16_t so = read_u16_be(result + tbl_off + 4);
+
+            for (int j = 0; j < nc; j++) {
+                size_t rec_off = tbl_off + 6 + (size_t)j * 12;
+                if (rec_off + 12 > new_total) break;
+
+                uint16_t plat = read_u16_be(result + rec_off);
+                uint16_t nid = read_u16_be(result + rec_off + 6);
+                uint16_t slen = read_u16_be(result + rec_off + 8);
+                uint16_t soff = read_u16_be(result + rec_off + 10);
+
+                if (nid != 1 && nid != 4 && nid != 6) continue;
+
+                size_t abs_off = tbl_off + so + soff;
+                if (abs_off + slen > new_total) continue;
+
+                /* Find '+' in the string and strip everything before it */
+                if (plat == 3 || plat == 0) {
+                    /* UTF-16BE: look for 0x00 0x2B ('+') */
+                    for (int k = 0; k + 1 < slen; k += 2) {
+                        if (result[abs_off + k] == 0x00 && result[abs_off + k + 1] == 0x2B) {
+                            int prefix_bytes = k + 2; /* include the '+' */
+                            /* Adjust offset to skip the prefix */
+                            write_u16_be(result + rec_off + 10, soff + prefix_bytes);
+                            write_u16_be(result + rec_off + 8, slen - prefix_bytes);
+                            break;
+                        }
+                    }
+                } else {
+                    /* ASCII/MacRoman: look for '+' */
+                    for (int k = 0; k < slen; k++) {
+                        if (result[abs_off + k] == '+') {
+                            int prefix_bytes = k + 1;
+                            write_u16_be(result + rec_off + 10, soff + prefix_bytes);
+                            write_u16_be(result + rec_off + 8, slen - prefix_bytes);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            /* Update the name table checksum in the directory */
+            write_u32_be(result + 12 + i * 16 + 4,
+                         otf_checksum(result + tbl_off, tbl_len_val));
+            break;
+        }
+    }
+
+    /* Find where to append new tables */
+    size_t append_off = 0;
+    for (int i = 0; i < orig_num_tables; i++) {
+        uint32_t new_off = read_u32_be(result + 12 + i * 16 + 8);
+        uint32_t tlen = read_u32_be(result + 12 + i * 16 + 12);
+        size_t end = new_off + ((tlen + 3) & ~3);
+        if (end > append_off) append_off = end;
+    }
+
+    /* Add new table directory entries and data */
+    int extra_idx = 0;
+    if (needs_cmap) {
+        uint8_t *rec = result + 12 + (orig_num_tables + extra_idx) * 16;
+        write_u32_be(rec + 0, 0x636D6170); /* 'cmap' */
+        write_u32_be(rec + 4, otf_checksum(cmap_data, cmap_size));
+        write_u32_be(rec + 8, (uint32_t)append_off);
+        write_u32_be(rec + 12, (uint32_t)cmap_size);
+        memcpy(result + append_off, cmap_data, cmap_size);
+        append_off += cmap_padded;
+        extra_idx++;
+    }
+    if (needs_post) {
+        uint8_t *rec = result + 12 + (orig_num_tables + extra_idx) * 16;
+        write_u32_be(rec + 0, 0x706F7374); /* 'post' */
+        write_u32_be(rec + 4, otf_checksum(post_data, post_size));
+        write_u32_be(rec + 8, (uint32_t)append_off);
+        write_u32_be(rec + 12, (uint32_t)post_size);
+        memcpy(result + append_off, post_data, post_size);
+        append_off += post_padded;
+        extra_idx++;
+    }
+
+    *out_len = append_off;
+    return result;
 }
 
 /*
@@ -1117,48 +1587,64 @@ bool pdf_font_try_load_embedded(PdfDocument *doc, PdfDict *resources,
     if (!font_data || font_data_len < 4)
         return false;
 
-    /* Determine font name.
-     * TrueType/OpenType: parse the name table.
-     * Type1C (bare CFF): use BaseFont from PDF. */
+    /* Get a clean font name: use BaseFont from PDF, strip subset prefix.
+     * This is more reliable than parsing the name table, since subset fonts
+     * often embed the subset prefix in their name table too. */
     char family_name[256];
     family_name[0] = '\0';
 
-    if (!is_type1c) {
-        ttf_get_family_name(font_data, font_data_len, family_name, sizeof(family_name));
+    const char *base_font = get_base_font_name(doc, resources, font_res_name);
+    if (base_font) {
+        const char *stripped = strip_subset_prefix(base_font);
+        strncpy(family_name, stripped, sizeof(family_name) - 1);
+        family_name[sizeof(family_name) - 1] = '\0';
     }
 
-    /* Fallback (or Type1C): use BaseFont from PDF, strip subset prefix */
-    if (family_name[0] == '\0') {
-        const char *base_font = get_base_font_name(doc, resources, font_res_name);
-        if (base_font) {
-            const char *stripped = strip_subset_prefix(base_font);
-            strncpy(family_name, stripped, sizeof(family_name) - 1);
-            family_name[sizeof(family_name) - 1] = '\0';
+    /* If no BaseFont, try the TTF name table */
+    if (family_name[0] == '\0' && !is_type1c) {
+        ttf_get_family_name(font_data, font_data_len, family_name, sizeof(family_name));
+        /* Strip subset prefix from TTF name too */
+        const char *stripped = strip_subset_prefix(family_name);
+        if (stripped != family_name) {
+            memmove(family_name, stripped, strlen(stripped) + 1);
         }
     }
 
     if (family_name[0] == '\0')
         return false;
 
-    /* For Type1C, wrap CFF data in an OpenType container */
+    /* Prepare font data for loading.
+     * - TrueType: patch to add missing cmap/post tables
+     * - Type1C (CFF): wrap in OpenType container
+     * Both types of font data must be valid for AddFontMemResourceEx. */
     uint8_t *load_data = (uint8_t *)font_data;
     size_t load_data_len = font_data_len;
-    uint8_t *otf_wrapper = NULL;
+    uint8_t *patched_data = NULL;
 
     if (is_type1c) {
+        /* CFF: wrap in OpenType container */
         size_t otf_len = 0;
-        otf_wrapper = wrap_cff_in_otf(font_data, font_data_len, family_name, &otf_len);
-        if (!otf_wrapper)
+        patched_data = wrap_cff_in_otf(font_data, font_data_len, family_name, &otf_len);
+        if (!patched_data)
             return false;
-        load_data = otf_wrapper;
+        load_data = patched_data;
         load_data_len = otf_len;
+    } else {
+        /* TrueType: patch to add missing required tables */
+        size_t patched_len = 0;
+        patched_data = ttf_patch_for_gdi(font_data, font_data_len, family_name, &patched_len);
+        if (patched_data) {
+            load_data = patched_data;
+            load_data_len = patched_len;
+        }
+        /* If no patching needed, try loading the original data directly */
     }
 
     /* Load the font into GDI memory */
     DWORD num_fonts = 0;
     HANDLE hFont = AddFontMemResourceEx((void *)load_data, (DWORD)load_data_len,
                                          NULL, &num_fonts);
-    if (otf_wrapper) free(otf_wrapper);
+    if (patched_data) free(patched_data);
 
     if (!hFont || num_fonts == 0)
         return false;

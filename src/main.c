@@ -7,6 +7,7 @@
 #include "pdf_parser.h"
 #include "pdf_render.h"
 #include "pdf_fonts.h"
+#include "pdf_glyph_render.h"
 
 #include <windowsx.h>
 #include <shellapi.h>
@@ -254,6 +255,7 @@ static int BatchExport(LPWSTR lpCmd)
     DeleteDC(hdc);
     DeleteObject(hbm);
     pdf_close(&doc);
+    glyph_cache_cleanup();
     pdf_fonts_cleanup();
     return 0;
 }
@@ -350,6 +352,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmd, int nSho
 
     /* Cleanup */
     CloseDocument();
+    glyph_cache_cleanup();
     pdf_fonts_cleanup();
     if (g_app.hPageBitmap) DeleteObject(g_app.hPageBitmap);
     DeleteObject(g_app.hBgBrush);
