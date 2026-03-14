@@ -52,6 +52,7 @@ struct ParsedFont {
     bool        is_bold;
     bool        is_italic;
     bool        is_cff;          /* true = CFF, false = TrueType */
+    bool        is_type1;        /* true = Type1 (PFB/PFA) */
 
     /* Raw font data (kept alive for glyph extraction) */
     uint8_t    *data;
@@ -98,6 +99,20 @@ struct ParsedFont {
     const uint8_t *string_index_ptr; /* pointer to String INDEX in CFF data */
     int         string_index_count;  /* number of entries in String INDEX */
 
+    /* ── Type1-specific fields ── */
+    uint8_t    *t1_subrs_data;       /* concatenated decrypted subroutine charstrings */
+    size_t     *t1_subrs_offs;       /* offset of each subroutine within t1_subrs_data */
+    size_t     *t1_subrs_lens;       /* lengths of each subroutine */
+    int         t1_subrs_count;      /* number of subroutines */
+
+    uint8_t    *t1_charstrings_data; /* concatenated decrypted charstring data */
+    size_t     *t1_charstrings_offs; /* offset of each charstring within t1_charstrings_data */
+    size_t     *t1_charstrings_lens; /* length of each charstring */
+    char      **t1_glyph_names;      /* glyph names (for GID->name mapping) */
+    int         t1_num_charstrings;  /* number of charstrings */
+
+    int         t1_lenIV;            /* charstring encryption skip bytes (default 4) */
+
     /* ── TrueType-specific fields ── */
     const uint8_t *glyf_table;
     size_t      glyf_len;
@@ -125,6 +140,17 @@ ParsedFont *parsed_font_from_cff(const uint8_t *data, size_t len);
  * Caller must call parsed_font_free() when done.
  */
 ParsedFont *parsed_font_from_truetype(const uint8_t *data, size_t len);
+
+/*
+ * Parse a Type1 font from raw PFB/PFA data (from /FontFile).
+ * Returns a ParsedFont on success, NULL on failure.
+ * Caller must call parsed_font_free() when done.
+ */
+ParsedFont *parsed_font_from_type1(const uint8_t *data, size_t len);
+
+/* ─── Type1 glyph extraction (called from dispatch in pdf_glyph_cff.c) ─── */
+bool t1_get_glyph_by_gid(ParsedFont *font, int gid, GlyphOutline *outline);
+int  t1_find_gid_by_name(ParsedFont *font, const char *glyph_name);
 
 /*
  * Free a parsed font and all associated resources.

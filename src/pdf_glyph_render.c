@@ -59,17 +59,20 @@ static int cache_find_by_obj(int obj_num)
  * dict) and composite/Type0 fonts (through /DescendantFonts).
  */
 
-/* Search a font descriptor dict for /FontFile2 or /FontFile3 streams.
+/* Search a font descriptor dict for /FontFile, /FontFile2, or /FontFile3 streams.
  * Returns the stream PdfObj and the object number, or NULL/-1 on failure.
- * Sets *out_is_cff if the stream is Type1C (bare CFF data). */
+ * Sets *out_is_cff if the stream is Type1C (bare CFF data).
+ * Sets *out_is_type1 if the stream is Type1 (PFB/PFA from /FontFile). */
 static PdfObj *find_font_stream_in_descriptor(PdfDocument *doc, PdfDict *descriptor,
-                                               int *out_obj_num, bool *out_is_cff)
+                                               int *out_obj_num, bool *out_is_cff,
+                                               bool *out_is_type1)
 {
     *out_obj_num = -1;
     *out_is_cff = false;
+    *out_is_type1 = false;
 
-    /* Check FontFile2 (TrueType) and FontFile3 (CFF/OpenType) */
-    static const char *keys[] = { "FontFile2", "FontFile3", NULL };
+    /* Check FontFile (Type1), FontFile2 (TrueType), FontFile3 (CFF/OpenType) */
+    static const char *keys[] = { "FontFile2", "FontFile3", "FontFile", NULL };
     for (int k = 0; keys[k]; k++) {
         PdfObj *ff = pdf_dict_get(descriptor, keys[k]);
         if (!ff) continue;
@@ -96,6 +99,9 @@ static PdfObj *find_font_stream_in_descriptor(PdfDocument *doc, PdfDict *descrip
                  * and if that fails the caller falls back. For now mark as CFF. */
                 *out_is_cff = true;
             }
+        } else if (strcmp(keys[k], "FontFile") == 0) {
+            /* FontFile = Type1 (PFB/PFA format) */
+            *out_is_type1 = true;
         } else {
             /* FontFile2 = TrueType */
             *out_is_cff = false;
@@ -110,13 +116,15 @@ static PdfObj *find_font_stream_in_descriptor(PdfDocument *doc, PdfDict *descrip
 
 /* Navigate from a font resource name to the embedded font stream.
  * Handles both simple fonts and Type0 composite fonts.
- * Returns the stream object, sets *out_obj_num and *out_is_cff. */
+ * Returns the stream object, sets *out_obj_num, *out_is_cff, and *out_is_type1. */
 static PdfObj *find_font_stream(PdfDocument *doc, PdfDict *resources,
                                  const char *font_res_name,
-                                 int *out_obj_num, bool *out_is_cff)
+                                 int *out_obj_num, bool *out_is_cff,
+                                 bool *out_is_type1)
 {
     *out_obj_num = -1;
     *out_is_cff = false;
+    *out_is_type1 = false;
 
     /* Get /Font dictionary from resources */
     PdfObj *fonts_obj = pdf_dict_get(resources, "Font");
@@ -136,7 +144,7 @@ static PdfObj *find_font_stream(PdfDocument *doc, PdfDict *resources,
         descriptor = pdf_resolve(doc, descriptor);
         if (descriptor && descriptor->type == PDF_OBJ_DICT) {
             PdfObj *stream = find_font_stream_in_descriptor(
-                doc, descriptor->dict, out_obj_num, out_is_cff);
+                doc, descriptor->dict, out_obj_num, out_is_cff, out_is_type1);
             if (stream) return stream;
         }
     }
@@ -158,7 +166,7 @@ static PdfObj *find_font_stream(PdfDocument *doc, PdfDict *resources,
                 if (!cid_desc || cid_desc->type != PDF_OBJ_DICT) continue;
 
                 PdfObj *stream = find_font_stream_in_descriptor(
-                    doc, cid_desc->dict, out_obj_num, out_is_cff);
+                    doc, cid_desc->dict, out_obj_num, out_is_cff, out_is_type1);
                 if (stream) return stream;
             }
         }
@@ -176,8 +184,9 @@ static ParsedFont *extract_embedded_font(PdfDocument *doc, PdfDict *resources,
     /* Find the font stream */
     int obj_num = -1;
     bool is_cff = false;
+    bool is_type1 = false;
     PdfObj *stream_obj = find_font_stream(doc, resources, font_res_name,
-                                           &obj_num, &is_cff);
+                                           &obj_num, &is_cff, &is_type1);
     if (!stream_obj || obj_num < 0)
         return NULL;
 
@@ -214,7 +223,9 @@ static ParsedFont *extract_embedded_font(PdfDocument *doc, PdfDict *resources,
 
     /* Parse the font data */
     ParsedFont *parsed = NULL;
-    if (is_cff) {
+    if (is_type1) {
+        parsed = parsed_font_from_type1(font_data, font_data_len);
+    } else if (is_cff) {
         parsed = parsed_font_from_cff(font_data, font_data_len);
     } else {
         parsed = parsed_font_from_truetype(font_data, font_data_len);
@@ -840,7 +851,7 @@ bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
 
     /* Get PDF encoding map for this font (if available) */
     PdfEncodingMap *enc_map = NULL;
-    if (font->is_cff && font->charset_sids) {
+    if ((font->is_cff && font->charset_sids) || font->is_type1) {
         enc_map = get_cached_encoding(ctx->doc, resources, gs->font_name);
     }
 
@@ -874,7 +885,7 @@ bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
         bool got_glyph = false;
         int resolved_gid = -1;
 
-        if (enc_map && font->is_cff) {
+        if (enc_map && (font->is_cff || font->is_type1)) {
             /* PDF encoding resolution path:
              * char_code -> glyph_name (via PDF /Encoding)
              * -> GID (via CFF charset name search)
@@ -886,10 +897,11 @@ bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
                     got_glyph = parsed_font_get_glyph_by_gid(font, resolved_gid, &outline);
                 }
             }
+
         }
 
         if (!got_glyph) {
-            /* Fallback: use the CFF font's built-in encoding */
+            /* Fallback: use the font's built-in encoding */
             got_glyph = parsed_font_get_glyph(font, char_code, &outline);
         }
 
