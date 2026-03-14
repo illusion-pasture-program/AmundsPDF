@@ -79,6 +79,9 @@ typedef struct {
     size_t      raw_length;     /* length of raw data */
     uint8_t    *decoded_data;   /* decoded data (after filters) */
     size_t      decoded_length; /* length of decoded data */
+    int         obj_num;        /* owning object number (for decryption) */
+    int         gen_num;        /* owning generation number (for decryption) */
+    bool        decrypted;      /* true if raw_data has been decrypted already */
 } PdfStream;
 
 /* ─── PDF Indirect Reference ─── */
@@ -117,6 +120,8 @@ typedef struct {
 } XRefEntry;
 
 /* ─── PDF Document ─── */
+typedef struct PdfCryptState PdfCryptState;  /* forward declaration (defined in pdf_crypt.h) */
+
 typedef struct {
     /* Memory-mapped file */
     HANDLE      hFile;
@@ -138,6 +143,9 @@ typedef struct {
     /* Version */
     int         version_major;
     int         version_minor;
+
+    /* Encryption state (NULL if not encrypted) */
+    PdfCryptState *crypt;
 } PdfDocument;
 
 /* ─── PDF Matrix (3x3 affine, stored as 6 values: a b c d e f) ─── */

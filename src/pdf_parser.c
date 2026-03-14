@@ -8,6 +8,7 @@
 
 #include "pdf_parser.h"
 #include "pdf_inflate.h"
+#include "pdf_crypt.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Internal constants
@@ -872,6 +873,12 @@ static PdfObj *parse_indirect_object(ParseCtx *ctx, int *out_obj_num, int *out_g
     if (out_obj_num) *out_obj_num = obj_num;
     if (out_gen_num) *out_gen_num = gen_num;
 
+    /* Record the object/generation number on stream objects for decryption */
+    if (val && val->type == PDF_OBJ_STREAM && val->stream) {
+        val->stream->obj_num = obj_num;
+        val->stream->gen_num = gen_num;
+    }
+
     return val;
 }
 
@@ -1443,6 +1450,25 @@ bool pdf_decode_stream(PdfDocument *doc, PdfStream *stream) {
         return true;
     }
 
+    /* Decrypt stream data if the document is encrypted.
+     * Decryption must happen before any filter decompression.
+     * Note: XRef streams (/Type /XRef) are not encrypted per PDF spec.
+     * The decrypted flag prevents double-decryption on retry. */
+    if (doc && doc->crypt && pdf_crypt_is_encrypted(doc->crypt) && !stream->decrypted) {
+        stream->decrypted = true;
+        bool is_xref_stream = false;
+        if (stream->dict) {
+            const char *stype = pdf_dict_get_name(stream->dict, "Type");
+            if (stype && strcmp(stype, "XRef") == 0)
+                is_xref_stream = true;
+        }
+        if (!is_xref_stream) {
+            pdf_crypt_decrypt_stream(doc->crypt,
+                                     stream->obj_num, stream->gen_num,
+                                     stream->raw_data, stream->raw_length);
+        }
+    }
+
     PdfDict *dict = stream->dict;
     PdfObj *filter_obj = dict ? pdf_dict_get(dict, "Filter") : NULL;
 
@@ -1948,6 +1974,24 @@ bool pdf_open(PdfDocument *doc, const wchar_t *path) {
             goto fail;
     }
 
+    /* ─── Initialize encryption (if present) ─── */
+    {
+        PdfCryptState *crypt = (PdfCryptState *)calloc(1, sizeof(PdfCryptState));
+        if (crypt) {
+            if (!pdf_crypt_init(crypt, doc->trailer, doc)) {
+                /* Encryption requires a password we can't provide */
+                free(crypt);
+                /* Continue anyway -- some objects may be accessible */
+            } else {
+                if (pdf_crypt_is_encrypted(crypt)) {
+                    doc->crypt = crypt;
+                } else {
+                    free(crypt);
+                }
+            }
+        }
+    }
+
     /* ─── Build page tree ─── */
     if (!build_page_tree(doc))
         goto fail;
@@ -1961,6 +2005,10 @@ fail:
 
 void pdf_close(PdfDocument *doc) {
     if (!doc) return;
+
+    /* Free encryption state */
+    free(doc->crypt);
+    doc->crypt = NULL;
 
     /* Free pages array (page objects are owned by the cache, not freed here) */
     free(doc->pages);

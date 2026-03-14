@@ -875,6 +875,13 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
     const char *base_font = resolve_base_font(ctx->doc, resources, gs->font_name);
     if (!base_font) base_font = "Helvetica";
 
+    /* Try to load embedded font from the PDF.
+     * If the font is embedded as TrueType or OpenType, this loads it into GDI
+     * memory and gives us the actual family name to use for HFONT creation. */
+    char embedded_family[256];
+    bool has_embedded_font = pdf_font_try_load_embedded(
+        ctx->doc, resources, gs->font_name, embedded_family, sizeof(embedded_family));
+
     /* Compute effective font size in device pixels.
      * The text matrix and CTM together transform text space to device space.
      * The effective vertical scale is sqrt(b^2 + d^2) of the combined matrix,
@@ -895,7 +902,14 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
     /* Normalize to [0, 360) */
     rotation_deg = ((rotation_deg % 360) + 360) % 360;
 
-    HFONT hfont = pdf_font_create_px(base_font, font_height_px, rotation_deg);
+    /* Create the GDI font. If we loaded an embedded font, use its family name
+     * directly; otherwise fall back to the system font mapping heuristics. */
+    HFONT hfont;
+    if (has_embedded_font) {
+        hfont = pdf_font_create_px(embedded_family, font_height_px, rotation_deg);
+    } else {
+        hfont = pdf_font_create_px(base_font, font_height_px, rotation_deg);
+    }
     if (!hfont) return;
 
     HFONT old_font = (HFONT)SelectObject(hdc, hfont);
