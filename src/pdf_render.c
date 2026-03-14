@@ -10,6 +10,7 @@
 #include "pdf_render.h"
 #include "pdf_parser.h"
 #include "pdf_fonts.h"
+#include "pdf_glyph_render.h"
 #include <objbase.h>  /* CoInitializeEx, CoCreateInstance for WIC image decoding */
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -868,6 +869,13 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
 {
     if (len == 0) return;
 
+    /* Try the software rasterizer path first for anti-aliased rendering.
+     * glyph_render_text_string will extract embedded font outlines, render
+     * them with 8x AA, and blend onto the page bitmap. If no embedded font
+     * is available, it returns false and we fall through to TextOutW. */
+    if (glyph_render_text_string(ctx, resources, str, len))
+        return;
+
     PdfGraphicsState *gs = current_gs(ctx);
     HDC hdc = ctx->hdc;
 
@@ -946,7 +954,7 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
         /* Skip invisible text rendering mode */
         if (gs->text_render_mode == 3) {
             /* Still advance position */
-        } else {
+        } else if (char_code >= 0x20 || char_code == 0) {
             /* Compute device position from text matrix * CTM.
              * Apply text rise: shift vertically in text space by gs->text_rise */
             PdfMatrix combined = pdf_matrix_multiply(ctx->text_matrix, gs->ctm);
@@ -961,6 +969,9 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
 
             TextOutW(hdc, dx, dy, &wc, 1);
         }
+        /* else: control characters (0x01-0x1F) are skipped - they are not
+         * renderable glyphs. Some PDFs embed CR/LF in text strings as
+         * line-break hints that should not produce visible output. */
 
         /* Advance text position using PDF-specified widths.
          * For fonts without PDF widths, use GDI-measured widths for better
