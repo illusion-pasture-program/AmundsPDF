@@ -122,10 +122,154 @@ static double   GetPageHeightPts(void);
 /* ═══════════════════════════════════════════════════════════════════════
  *  wWinMain
  * ═══════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════
+ *  Batch export mode: --export output.bmp [--page N] [--scale S] input.pdf
+ *  Renders a page directly to a BMP file without opening a window.
+ * ═══════════════════════════════════════════════════════════════════════ */
+static int BatchExport(LPWSTR lpCmd)
+{
+    /* Parse arguments: --export <out.bmp> [--page N] [--scale S] <input.pdf> */
+    wchar_t export_path[MAX_PATH] = {0};
+    wchar_t input_path[MAX_PATH] = {0};
+    int page_idx = 0;
+    double scale = 2.0;
+
+    /* Simple argument parsing */
+    wchar_t *p = lpCmd;
+    bool got_export = false;
+    bool expect_export_path = false;
+    bool expect_page = false;
+    bool expect_scale = false;
+
+    while (p && *p) {
+        /* Skip whitespace */
+        while (*p == L' ' || *p == L'\t') p++;
+        if (!*p) break;
+
+        /* Extract token */
+        wchar_t token[MAX_PATH] = {0};
+        int ti = 0;
+        if (*p == L'"') {
+            p++;
+            while (*p && *p != L'"' && ti < MAX_PATH - 1)
+                token[ti++] = *p++;
+            if (*p == L'"') p++;
+        } else {
+            while (*p && *p != L' ' && *p != L'\t' && ti < MAX_PATH - 1)
+                token[ti++] = *p++;
+        }
+        token[ti] = L'\0';
+
+        if (expect_export_path) {
+            StringCchCopyW(export_path, MAX_PATH, token);
+            expect_export_path = false;
+            continue;
+        }
+        if (expect_page) {
+            page_idx = _wtoi(token) - 1;  /* 1-based to 0-based */
+            if (page_idx < 0) page_idx = 0;
+            expect_page = false;
+            continue;
+        }
+        if (expect_scale) {
+            scale = _wtof(token);
+            if (scale <= 0.0) scale = 2.0;
+            expect_scale = false;
+            continue;
+        }
+
+        if (wcsicmp(token, L"--export") == 0) {
+            got_export = true;
+            expect_export_path = true;
+        } else if (wcsicmp(token, L"--page") == 0) {
+            expect_page = true;
+        } else if (wcsicmp(token, L"--scale") == 0) {
+            expect_scale = true;
+        } else {
+            /* Assume it's the input PDF path */
+            StringCchCopyW(input_path, MAX_PATH, token);
+        }
+    }
+
+    if (!got_export || !export_path[0] || !input_path[0])
+        return -1;  /* not export mode or missing args */
+
+    /* Open the PDF */
+    PdfDocument doc;
+    memset(&doc, 0, sizeof(doc));
+    if (!pdf_open(&doc, input_path)) {
+        return 1;
+    }
+
+    if (page_idx >= pdf_page_count(&doc))
+        page_idx = pdf_page_count(&doc) - 1;
+
+    /* Render the page */
+    int bmp_w = 0, bmp_h = 0;
+    HBITMAP hbm = pdf_render_page(&doc, page_idx, scale, &bmp_w, &bmp_h);
+    if (!hbm) {
+        pdf_close(&doc);
+        return 1;
+    }
+
+    /* Save as BMP file */
+    HDC hdc = CreateCompatibleDC(NULL);
+    HBITMAP old = (HBITMAP)SelectObject(hdc, hbm);
+
+    BITMAPINFOHEADER bih;
+    memset(&bih, 0, sizeof(bih));
+    bih.biSize = sizeof(bih);
+    bih.biWidth = bmp_w;
+    bih.biHeight = bmp_h;  /* bottom-up */
+    bih.biPlanes = 1;
+    bih.biBitCount = 24;
+    bih.biCompression = BI_RGB;
+
+    int row_stride = ((bmp_w * 3 + 3) & ~3);
+    DWORD img_size = (DWORD)row_stride * bmp_h;
+
+    uint8_t *bits = (uint8_t *)malloc(img_size);
+    if (bits) {
+        GetDIBits(hdc, hbm, 0, bmp_h, bits, (BITMAPINFO *)&bih, DIB_RGB_COLORS);
+
+        HANDLE hFile = CreateFileW(export_path, GENERIC_WRITE, 0, NULL,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            BITMAPFILEHEADER bfh;
+            memset(&bfh, 0, sizeof(bfh));
+            bfh.bfType = 0x4D42;  /* 'BM' */
+            bfh.bfSize = sizeof(bfh) + sizeof(bih) + img_size;
+            bfh.bfOffBits = sizeof(bfh) + sizeof(bih);
+
+            DWORD written;
+            WriteFile(hFile, &bfh, sizeof(bfh), &written, NULL);
+            WriteFile(hFile, &bih, sizeof(bih), &written, NULL);
+            WriteFile(hFile, bits, img_size, &written, NULL);
+            CloseHandle(hFile);
+        }
+        free(bits);
+    }
+
+    SelectObject(hdc, old);
+    DeleteDC(hdc);
+    DeleteObject(hbm);
+    pdf_close(&doc);
+    pdf_fonts_cleanup();
+    return 0;
+}
+
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmd, int nShow)
 {
     (void)hPrev;
     (void)nShow;
+
+    /* Check for batch export mode */
+    if (lpCmd && wcsstr(lpCmd, L"--export")) {
+        int result = BatchExport(lpCmd);
+        if (result >= 0)
+            return result;
+        /* result == -1 means not valid export args, fall through to GUI */
+    }
 
     g_app.hInst       = hInstance;
     g_app.hBgBrush    = CreateSolidBrush(BG_COLOR);

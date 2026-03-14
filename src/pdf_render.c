@@ -10,6 +10,7 @@
 #include "pdf_render.h"
 #include "pdf_parser.h"
 #include "pdf_fonts.h"
+#include <objbase.h>  /* CoInitializeEx, CoCreateInstance for WIC image decoding */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Content Stream Tokenizer
@@ -754,6 +755,30 @@ static const char *resolve_base_font(PdfDocument *doc, PdfDict *resources,
 }
 
 /*
+ * Check if a font has a /Widths array in the PDF.
+ * Returns true if PDF-specific widths are available.
+ */
+static bool font_has_pdf_widths(PdfDocument *doc, PdfDict *resources,
+                                 const char *font_res_name)
+{
+    PdfObj *fonts_obj = pdf_dict_get(resources, "Font");
+    if (!fonts_obj) return false;
+    fonts_obj = pdf_resolve(doc, fonts_obj);
+    if (!fonts_obj || fonts_obj->type != PDF_OBJ_DICT) return false;
+
+    PdfObj *font_obj = pdf_dict_get(fonts_obj->dict, font_res_name);
+    if (!font_obj) return false;
+    font_obj = pdf_resolve(doc, font_obj);
+    if (!font_obj || font_obj->type != PDF_OBJ_DICT) return false;
+
+    PdfObj *widths_obj = pdf_dict_get(font_obj->dict, "Widths");
+    if (!widths_obj) return false;
+    widths_obj = pdf_resolve(doc, widths_obj);
+    return (widths_obj && widths_obj->type == PDF_OBJ_ARRAY &&
+            pdf_array_len(widths_obj->array) > 0);
+}
+
+/*
  * Look up font widths from the font dictionary.
  * Returns the width of a character in 1/1000 text space units.
  * If no /Widths array, falls back to standard font metrics.
@@ -815,6 +840,26 @@ static int get_font_char_width(PdfDocument *doc, PdfDict *resources,
 }
 
 /*
+ * Get character advance from the GDI font actually being used for rendering.
+ * Returns the advance in 1/1000 text space units (to match PDF metrics scale).
+ * This gives more accurate positioning when using font substitution.
+ */
+static int get_gdi_char_width(HDC hdc, int char_code, double font_size_px)
+{
+    wchar_t wc = (wchar_t)char_code;
+    SIZE sz;
+    if (GetTextExtentPoint32W(hdc, &wc, 1, &sz)) {
+        /* Convert pixel width to 1/1000 text space units.
+         * font_size_px is the absolute font height in pixels.
+         * width_in_thousandths = (pixel_width / font_size_px) * 1000 */
+        if (font_size_px > 0.001) {
+            return (int)(sz.cx / font_size_px * 1000.0 + 0.5);
+        }
+    }
+    return 0;
+}
+
+/*
  * Render a text string at the current text position.
  * Updates the text matrix to advance past the rendered text.
  */
@@ -846,6 +891,11 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
     HFONT old_font = (HFONT)SelectObject(hdc, hfont);
     SetBkMode(hdc, TRANSPARENT);
 
+    /* PDF positions text at the baseline, but GDI's TextOutW defaults to
+     * rendering from the top-left of the character cell. Set TA_BASELINE
+     * so TextOutW interprets the y-coordinate as the baseline position. */
+    SetTextAlign(hdc, TA_BASELINE | TA_LEFT);
+
     /* Text rendering mode determines color and style:
      * 0 = fill, 1 = stroke, 2 = fill+stroke, 3 = invisible,
      * 4-7 = same but add to clipping path */
@@ -860,6 +910,11 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
     /* Horizontal scaling factor */
     double h_scale = gs->horiz_scaling / 100.0;
 
+    /* Check if this font has PDF-embedded widths. If not, we'll use GDI
+     * measured widths for more accurate positioning with substituted fonts. */
+    bool has_pdf_widths = font_has_pdf_widths(ctx->doc, resources, gs->font_name);
+    double abs_font_height_px = fabs((double)font_height_px);
+
     /* Render each character individually for accurate positioning */
     for (size_t i = 0; i < len; i++) {
         int char_code = str[i];
@@ -868,13 +923,13 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
         if (gs->text_render_mode == 3) {
             /* Still advance position */
         } else {
-            /* Compute device position from text matrix * CTM */
+            /* Compute device position from text matrix * CTM.
+             * Apply text rise: shift vertically in text space by gs->text_rise */
             PdfMatrix combined = pdf_matrix_multiply(ctx->text_matrix, gs->ctm);
-            int dx, dy;
             double ox, oy;
-            pdf_transform_point(combined, 0, 0, &ox, &oy);
-            dx = (int)(ox + 0.5);
-            dy = (int)(oy + 0.5);
+            pdf_transform_point(combined, 0, gs->text_rise, &ox, &oy);
+            int dx = (int)floor(ox + 0.5);
+            int dy = (int)floor(oy + 0.5);
 
             /* Convert char to wchar for TextOutW */
             wchar_t wc = (wchar_t)char_code;
@@ -883,9 +938,20 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
             TextOutW(hdc, dx, dy, &wc, 1);
         }
 
-        /* Advance text position */
-        int w = get_font_char_width(ctx->doc, resources, gs->font_name,
+        /* Advance text position using PDF-specified widths.
+         * For fonts without PDF widths, use GDI-measured widths for better
+         * alignment with the substituted font being rendered. */
+        int w;
+        if (has_pdf_widths) {
+            w = get_font_char_width(ctx->doc, resources, gs->font_name,
                                      char_code, base_font);
+        } else {
+            w = get_gdi_char_width(hdc, char_code, abs_font_height_px);
+            if (w <= 0) {
+                w = get_font_char_width(ctx->doc, resources, gs->font_name,
+                                         char_code, base_font);
+            }
+        }
         double advance = (double)w / 1000.0 * font_size;
 
         /* Add character spacing */
@@ -904,6 +970,9 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
         adv.e = advance;
         ctx->text_matrix = pdf_matrix_multiply(adv, ctx->text_matrix);
     }
+
+    /* Restore default text alignment so non-text GDI calls aren't affected */
+    SetTextAlign(hdc, TA_TOP | TA_LEFT);
 
     SelectObject(hdc, old_font);
     DeleteObject(hfont);
@@ -931,8 +1000,425 @@ static void render_TJ_array(PdfRenderCtx *ctx, PdfDict *resources,
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /*
+ * Resolve the base color space name from a /ColorSpace entry.
+ * Handles both simple names (/DeviceRGB) and arrays ([/Indexed ...]).
+ * For Indexed color spaces, also extracts the palette.
+ *
+ * Returns: components for the base color space (1, 3, or 4).
+ * Sets *is_indexed = true and populates palette_rgb/palette_count for Indexed.
+ */
+static int resolve_image_colorspace(PdfDocument *doc, PdfDict *dict,
+                                     bool *is_indexed,
+                                     uint8_t *palette_rgb, int *palette_count)
+{
+    *is_indexed = false;
+    *palette_count = 0;
+
+    PdfObj *cs_obj = pdf_dict_get(dict, "ColorSpace");
+    if (!cs_obj) return 3; /* default RGB */
+
+    cs_obj = pdf_resolve(doc, cs_obj);
+    if (!cs_obj) return 3;
+
+    /* Simple name: /DeviceRGB, /DeviceGray, etc. */
+    if (cs_obj->type == PDF_OBJ_NAME) {
+        const char *name = cs_obj->name;
+        if (strcmp(name, "DeviceGray") == 0 || strcmp(name, "CalGray") == 0) return 1;
+        if (strcmp(name, "DeviceRGB") == 0 || strcmp(name, "CalRGB") == 0)   return 3;
+        if (strcmp(name, "DeviceCMYK") == 0)  return 4;
+        return 3;
+    }
+
+    /* Array color space: [/name ...] */
+    if (cs_obj->type != PDF_OBJ_ARRAY) return 3;
+
+    PdfArray *arr = cs_obj->array;
+    if (pdf_array_len(arr) < 1) return 3;
+
+    PdfObj *cs_type = pdf_resolve(doc, pdf_array_get(arr, 0));
+    if (!cs_type || cs_type->type != PDF_OBJ_NAME) return 3;
+
+    const char *cs_name = cs_type->name;
+
+    /* [/CalGray <<...>>] or [/CalRGB <<...>>] */
+    if (strcmp(cs_name, "CalGray") == 0)  return 1;
+    if (strcmp(cs_name, "CalRGB") == 0)   return 3;
+    if (strcmp(cs_name, "ICCBased") == 0) {
+        /* [/ICCBased stream_ref] -- get /N from the ICC profile stream */
+        if (pdf_array_len(arr) >= 2) {
+            PdfObj *icc = pdf_resolve(doc, pdf_array_get(arr, 1));
+            if (icc && icc->type == PDF_OBJ_STREAM) {
+                int n = pdf_dict_get_int(icc->stream->dict, "N", 3);
+                return n;
+            }
+        }
+        return 3;
+    }
+
+    /* [/Indexed base hival lookup] */
+    if (strcmp(cs_name, "Indexed") == 0 && pdf_array_len(arr) >= 4) {
+        *is_indexed = true;
+
+        /* Determine base color space components */
+        PdfObj *base_cs = pdf_resolve(doc, pdf_array_get(arr, 1));
+        int base_components = 3;
+        if (base_cs && base_cs->type == PDF_OBJ_NAME) {
+            if (strcmp(base_cs->name, "DeviceGray") == 0 ||
+                strcmp(base_cs->name, "CalGray") == 0)     base_components = 1;
+            else if (strcmp(base_cs->name, "DeviceCMYK") == 0) base_components = 4;
+        }
+
+        /* hival: maximum valid index */
+        PdfObj *hival_obj = pdf_resolve(doc, pdf_array_get(arr, 2));
+        int hival = 255;
+        if (hival_obj) {
+            if (hival_obj->type == PDF_OBJ_INT) hival = (int)hival_obj->integer;
+            else if (hival_obj->type == PDF_OBJ_REAL) hival = (int)hival_obj->real;
+        }
+        if (hival > 255) hival = 255;
+        *palette_count = hival + 1;
+
+        /* lookup: either a string or a stream containing the palette data */
+        PdfObj *lookup = pdf_resolve(doc, pdf_array_get(arr, 3));
+        const uint8_t *pal_data = NULL;
+        size_t pal_len = 0;
+
+        if (lookup && lookup->type == PDF_OBJ_STRING) {
+            pal_data = lookup->string.data;
+            pal_len = lookup->string.length;
+        } else if (lookup && lookup->type == PDF_OBJ_STREAM) {
+            if (!lookup->stream->decoded_data)
+                pdf_decode_stream(doc, lookup->stream);
+            if (lookup->stream->decoded_data) {
+                pal_data = lookup->stream->decoded_data;
+                pal_len = lookup->stream->decoded_length;
+            }
+        }
+
+        /* Convert palette to RGB triplets */
+        if (pal_data && pal_len > 0) {
+            for (int i = 0; i <= hival && i < 256; i++) {
+                size_t pal_idx = (size_t)i * base_components;
+                uint8_t r = 0, g = 0, b = 0;
+
+                if (base_components == 1 && pal_idx < pal_len) {
+                    r = g = b = pal_data[pal_idx];
+                } else if (base_components == 3 && pal_idx + 2 < pal_len) {
+                    r = pal_data[pal_idx];
+                    g = pal_data[pal_idx + 1];
+                    b = pal_data[pal_idx + 2];
+                } else if (base_components == 4 && pal_idx + 3 < pal_len) {
+                    double c_ = pal_data[pal_idx]     / 255.0;
+                    double m_ = pal_data[pal_idx + 1] / 255.0;
+                    double y_ = pal_data[pal_idx + 2] / 255.0;
+                    double k_ = pal_data[pal_idx + 3] / 255.0;
+                    double rr = (1.0 - (c_ + k_));
+                    double gg = (1.0 - (m_ + k_));
+                    double bb = (1.0 - (y_ + k_));
+                    if (rr < 0.0) rr = 0.0; if (rr > 1.0) rr = 1.0;
+                    if (gg < 0.0) gg = 0.0; if (gg > 1.0) gg = 1.0;
+                    if (bb < 0.0) bb = 0.0; if (bb > 1.0) bb = 1.0;
+                    r = (uint8_t)(rr * 255.0 + 0.5);
+                    g = (uint8_t)(gg * 255.0 + 0.5);
+                    b = (uint8_t)(bb * 255.0 + 0.5);
+                }
+
+                palette_rgb[i * 3 + 0] = r;
+                palette_rgb[i * 3 + 1] = g;
+                palette_rgb[i * 3 + 2] = b;
+            }
+        }
+
+        return 1; /* Indexed images have 1 component (the index byte) */
+    }
+
+    /* [/Separation name altCS tintTransform] -- treat as grayscale fallback */
+    if (strcmp(cs_name, "Separation") == 0) return 1;
+
+    return 3; /* fallback */
+}
+
+/*
+ * Check if the image stream's filter is DCTDecode (JPEG) or JPXDecode (JPEG2000).
+ * Returns true if the raw stream data is JPEG-encoded and should be decoded
+ * with WIC rather than treated as raw pixel data.
+ */
+static bool image_has_jpeg_filter(PdfDict *dict)
+{
+    PdfObj *filter_obj = pdf_dict_get(dict, "Filter");
+    if (!filter_obj) return false;
+
+    /* Check direct name */
+    if (filter_obj->type == PDF_OBJ_NAME) {
+        return (strcmp(filter_obj->name, "DCTDecode") == 0 ||
+                strcmp(filter_obj->name, "DCT") == 0 ||
+                strcmp(filter_obj->name, "JPXDecode") == 0);
+    }
+
+    /* Check array of filters -- last filter determines the final format */
+    if (filter_obj->type == PDF_OBJ_ARRAY && pdf_array_len(filter_obj->array) > 0) {
+        PdfObj *last = pdf_array_get(filter_obj->array,
+                                      pdf_array_len(filter_obj->array) - 1);
+        if (last && last->type == PDF_OBJ_NAME) {
+            return (strcmp(last->name, "DCTDecode") == 0 ||
+                    strcmp(last->name, "DCT") == 0 ||
+                    strcmp(last->name, "JPXDecode") == 0);
+        }
+    }
+
+    return false;
+}
+
+/*
+ * Blit a completed HBITMAP image to the render context DC at the CTM position.
+ * Used by both raw-pixel and WIC-decoded image paths.
+ */
+static void blit_image_to_dc(PdfRenderCtx *ctx, HBITMAP hbm, int width, int height)
+{
+    /* Compute destination rectangle from CTM.
+     * Images in PDF are defined in a 1x1 unit square at the origin,
+     * and the CTM maps them to the target position and size. */
+    PdfMatrix m = current_gs(ctx)->ctm;
+    double x0, y0, x1, y1, x2, y2, x3, y3;
+    pdf_transform_point(m, 0.0, 0.0, &x0, &y0);
+    pdf_transform_point(m, 1.0, 0.0, &x1, &y1);
+    pdf_transform_point(m, 1.0, 1.0, &x2, &y2);
+    pdf_transform_point(m, 0.0, 1.0, &x3, &y3);
+
+    /* Find bounding box */
+    double min_x = x0, max_x = x0, min_y = y0, max_y = y0;
+    if (x1 < min_x) min_x = x1; if (x1 > max_x) max_x = x1;
+    if (x2 < min_x) min_x = x2; if (x2 > max_x) max_x = x2;
+    if (x3 < min_x) min_x = x3; if (x3 > max_x) max_x = x3;
+    if (y1 < min_y) min_y = y1; if (y1 > max_y) max_y = y1;
+    if (y2 < min_y) min_y = y2; if (y2 > max_y) max_y = y2;
+    if (y3 < min_y) min_y = y3; if (y3 > max_y) max_y = y3;
+
+    int dest_x = (int)(min_x + 0.5);
+    int dest_y = (int)(min_y + 0.5);
+    int dest_w = (int)(max_x - min_x + 0.5);
+    int dest_h = (int)(max_y - min_y + 0.5);
+    if (dest_w < 1) dest_w = 1;
+    if (dest_h < 1) dest_h = 1;
+
+    /* StretchBlt the image to the DC */
+    HDC mem_dc = CreateCompatibleDC(ctx->hdc);
+    HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
+    SetStretchBltMode(ctx->hdc, HALFTONE);
+    SetBrushOrgEx(ctx->hdc, 0, 0, NULL);
+    StretchBlt(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
+               mem_dc, 0, 0, width, height, SRCCOPY);
+    SelectObject(mem_dc, old_bm);
+    DeleteDC(mem_dc);
+}
+
+/*
+ * Decode a JPEG/JPX image using WIC (Windows Imaging Component).
+ * Returns an HBITMAP with 32bpp BGRA data, or NULL on failure.
+ * Sets *out_w and *out_h to the decoded image dimensions.
+ */
+static HBITMAP decode_image_wic(HDC hdc, const uint8_t *data, size_t data_len,
+                                 int *out_w, int *out_h)
+{
+    /* WIC COM interfaces -- we use C-style COM (no C++ needed) */
+    /* IIDs and CLSIDs for WIC */
+    static const GUID CLSID_WICImagingFactory_local =
+        {0xcacaf262,0x9370,0x4615,{0xa1,0x3b,0x9f,0x55,0x39,0xda,0x4c,0x0a}};
+    static const GUID IID_IWICImagingFactory_local =
+        {0xec5ec8a9,0xc395,0x4314,{0x9c,0x77,0x54,0xd7,0xa9,0x35,0xff,0x70}};
+    static const GUID GUID_WICPixelFormat32bppBGRA_local =
+        {0x6fddc324,0x4e03,0x4bfe,{0xb1,0x85,0x3d,0x77,0x76,0x8d,0xc9,0x10}};
+    static const GUID IID_IWICBitmapDecoder_local =
+        {0x9edde9e7,0x8dee,0x47ea,{0x99,0xdf,0xe6,0xfa,0xf2,0xed,0x44,0xbf}};
+    static const GUID IID_IWICStream_local =
+        {0x135ff860,0x22b7,0x4ddf,{0xb0,0xf6,0x21,0x8f,0x4f,0x29,0x9a,0x43}};
+    static const GUID IID_IWICFormatConverter_local =
+        {0x00000301,0xa8f2,0x4877,{0xba,0x0a,0xfd,0x2b,0x66,0x45,0xfb,0x94}};
+    static const GUID IID_IWICBitmapFrameDecode_local =
+        {0x3b16811b,0x6a43,0x4ec9,{0xa8,0x13,0x3d,0x93,0x0c,0x13,0xb9,0x40}};
+
+    *out_w = 0;
+    *out_h = 0;
+
+    /* Ensure COM is initialized (safe to call multiple times) */
+    static bool com_initialized = false;
+    if (!com_initialized) {
+        HRESULT hr_com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+        if (SUCCEEDED(hr_com) || hr_com == S_FALSE /* already initialized */)
+            com_initialized = true;
+        else
+            return NULL;
+    }
+
+    HRESULT hr;
+    IUnknown *factory_unk = NULL;
+
+    hr = CoCreateInstance(&CLSID_WICImagingFactory_local, NULL, CLSCTX_INPROC_SERVER,
+                          &IID_IWICImagingFactory_local, (void **)&factory_unk);
+    if (FAILED(hr) || !factory_unk) return NULL;
+
+    /* We'll use the raw COM vtable approach since we're in C.
+     * Cast to function pointers via the vtable. */
+    /* IWICImagingFactory vtable layout (IUnknown + factory methods):
+     *   0: QueryInterface, 1: AddRef, 2: Release,
+     *   3: CreateDecoderFromFilename, 4: CreateDecoderFromStream,
+     *   5: CreateDecoderFromFileHandle, 6: CreateComponentInfo,
+     *   7: CreateDecoder, 8: CreateEncoder,
+     *   9: CreatePalette, 10: CreateFormatConverter,
+     *  11: CreateBitmapScaler, 12: CreateBitmapClipper,
+     *  13: CreateBitmapFlipRotator, 14: CreateStream, ... */
+
+    void **factory_vtbl = *(void ***)factory_unk;
+    typedef HRESULT (STDMETHODCALLTYPE *FnRelease)(IUnknown *);
+    typedef HRESULT (STDMETHODCALLTYPE *FnCreateStream)(IUnknown *, IUnknown **);
+    typedef HRESULT (STDMETHODCALLTYPE *FnCreateFormatConverter)(IUnknown *, IUnknown **);
+    typedef HRESULT (STDMETHODCALLTYPE *FnCreateDecoderFromStream)(
+        IUnknown *, IUnknown *, const GUID *, DWORD, IUnknown **);
+
+    HBITMAP result = NULL;
+    IUnknown *wic_stream = NULL;
+    IUnknown *decoder = NULL;
+    IUnknown *frame = NULL;
+    IUnknown *converter = NULL;
+
+    /* Create WIC stream */
+    FnCreateStream fnCreateStream = (FnCreateStream)factory_vtbl[14];
+    hr = fnCreateStream(factory_unk, &wic_stream);
+    if (FAILED(hr) || !wic_stream) goto wic_cleanup;
+
+    /* IWICStream vtable: IUnknown(3) + IStream(9) + InitializeFromMemory(at index 15) */
+    {
+        void **stream_vtbl = *(void ***)wic_stream;
+        /* InitializeFromMemory is at vtable index 15:
+         * IUnknown: QI(0), AddRef(1), Release(2)
+         * ISequentialStream: Read(3), Write(4)
+         * IStream: Seek(5), SetSize(6), CopyTo(7), Commit(8), Revert(9),
+         *          LockRegion(10), UnlockRegion(11), Stat(12), Clone(13)
+         * IWICStream: InitializeFromIStream(14), InitializeFromFilename(15),
+         *             InitializeFromMemory(16), InitializeFromIStreamRegion(17) */
+        typedef HRESULT (STDMETHODCALLTYPE *FnInitFromMem)(
+            IUnknown *, uint8_t *, DWORD);
+        FnInitFromMem fnInitFromMem = (FnInitFromMem)stream_vtbl[16];
+        hr = fnInitFromMem(wic_stream, (uint8_t *)data, (DWORD)data_len);
+        if (FAILED(hr)) goto wic_cleanup;
+    }
+
+    /* Create decoder from stream */
+    {
+        FnCreateDecoderFromStream fnDecode =
+            (FnCreateDecoderFromStream)factory_vtbl[4];
+        static const GUID GUID_NULL_local =
+            {0x00000000,0x0000,0x0000,{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}};
+        hr = fnDecode(factory_unk, wic_stream, &GUID_NULL_local,
+                      0 /*WICDecodeMetadataCacheOnDemand*/, &decoder);
+        if (FAILED(hr) || !decoder) goto wic_cleanup;
+    }
+
+    /* Get first frame */
+    {
+        void **dec_vtbl = *(void ***)decoder;
+        /* IWICBitmapDecoder vtable:
+         * IUnknown(3) + QueryCapability(3), Initialize(4), GetContainerFormat(5),
+         * GetDecoderInfo(6), CopyPalette(7), GetMetadataQueryReader(8),
+         * GetPreview(9), GetColorContexts(10), GetThumbnail(11),
+         * GetFrameCount(12), GetFrame(13) */
+        typedef HRESULT (STDMETHODCALLTYPE *FnGetFrame)(
+            IUnknown *, UINT, IUnknown **);
+        FnGetFrame fnGetFrame = (FnGetFrame)dec_vtbl[13];
+        hr = fnGetFrame(decoder, 0, &frame);
+        if (FAILED(hr) || !frame) goto wic_cleanup;
+    }
+
+    /* Get frame dimensions */
+    UINT img_w = 0, img_h = 0;
+    {
+        void **frame_vtbl = *(void ***)frame;
+        /* IWICBitmapFrameDecode inherits IWICBitmapSource:
+         * IUnknown(3) + GetSize(3), GetPixelFormat(4), GetResolution(5),
+         * CopyPalette(6), CopyPixels(7) */
+        typedef HRESULT (STDMETHODCALLTYPE *FnGetSize)(
+            IUnknown *, UINT *, UINT *);
+        FnGetSize fnGetSize = (FnGetSize)frame_vtbl[3];
+        hr = fnGetSize(frame, &img_w, &img_h);
+        if (FAILED(hr) || img_w == 0 || img_h == 0) goto wic_cleanup;
+    }
+
+    /* Create format converter to BGRA32 */
+    {
+        FnCreateFormatConverter fnCreateConv =
+            (FnCreateFormatConverter)factory_vtbl[10];
+        hr = fnCreateConv(factory_unk, &converter);
+        if (FAILED(hr) || !converter) goto wic_cleanup;
+    }
+
+    /* Initialize converter */
+    {
+        void **conv_vtbl = *(void ***)converter;
+        /* IWICFormatConverter: IUnknown(3) + IWICBitmapSource(5) + Initialize(8) */
+        typedef HRESULT (STDMETHODCALLTYPE *FnInitialize)(
+            IUnknown *, IUnknown *, const GUID *, DWORD, IUnknown *, double, DWORD);
+        FnInitialize fnInit = (FnInitialize)conv_vtbl[8];
+        hr = fnInit(converter, frame, &GUID_WICPixelFormat32bppBGRA_local,
+                    0 /*WICBitmapDitherTypeNone*/, NULL, 0.0,
+                    0 /*WICBitmapPaletteTypeCustom*/);
+        if (FAILED(hr)) goto wic_cleanup;
+    }
+
+    /* Create DIB and copy pixels */
+    {
+        BITMAPINFO bmi;
+        memset(&bmi, 0, sizeof(bmi));
+        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth       = (LONG)img_w;
+        bmi.bmiHeader.biHeight      = -(LONG)img_h; /* top-down */
+        bmi.bmiHeader.biPlanes      = 1;
+        bmi.bmiHeader.biBitCount    = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        uint8_t *dib_bits = NULL;
+        result = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS,
+                                   (void **)&dib_bits, NULL, 0);
+        if (!result || !dib_bits) {
+            if (result) { DeleteObject(result); result = NULL; }
+            goto wic_cleanup;
+        }
+
+        /* CopyPixels from the converter */
+        void **conv_vtbl = *(void ***)converter;
+        typedef HRESULT (STDMETHODCALLTYPE *FnCopyPixels)(
+            IUnknown *, const void * /*WICRect*/, UINT, UINT, uint8_t *);
+        FnCopyPixels fnCopy = (FnCopyPixels)conv_vtbl[7];
+        UINT stride = img_w * 4;
+        hr = fnCopy(converter, NULL, stride, stride * img_h, dib_bits);
+        if (FAILED(hr)) {
+            DeleteObject(result);
+            result = NULL;
+            goto wic_cleanup;
+        }
+
+        *out_w = (int)img_w;
+        *out_h = (int)img_h;
+    }
+
+wic_cleanup:
+    if (converter) { ((FnRelease)((*(void ***)converter)[2]))(converter); }
+    if (frame)     { ((FnRelease)((*(void ***)frame)[2]))(frame); }
+    if (decoder)   { ((FnRelease)((*(void ***)decoder)[2]))(decoder); }
+    if (wic_stream){ ((FnRelease)((*(void ***)wic_stream)[2]))(wic_stream); }
+    if (factory_unk){ ((FnRelease)((*(void ***)factory_unk)[2]))(factory_unk); }
+
+    return result;
+}
+
+/*
  * Render an image XObject to the DC.
  * The image is placed at the current CTM position and scaled by the CTM.
+ *
+ * Handles:
+ *  - Simple color spaces: DeviceGray, DeviceRGB, DeviceCMYK, CalGray, CalRGB
+ *  - Indexed color spaces: [/Indexed base hival lookup]
+ *  - ICCBased color spaces (by component count)
+ *  - DCTDecode (JPEG) images via WIC
  */
 static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
 {
@@ -947,18 +1433,35 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
     int bpc    = pdf_dict_get_int(dict, "BitsPerComponent", 8);
     if (width <= 0 || height <= 0) return;
 
-    /* Determine color space */
-    const char *cs_name = pdf_dict_get_name(dict, "ColorSpace");
-    int components = 3; /* default RGB */
-    if (cs_name) {
-        if (strcmp(cs_name, "DeviceGray") == 0)      components = 1;
-        else if (strcmp(cs_name, "DeviceRGB") == 0)   components = 3;
-        else if (strcmp(cs_name, "DeviceCMYK") == 0)  components = 4;
-        else if (strcmp(cs_name, "CalGray") == 0)     components = 1;
-        else if (strcmp(cs_name, "CalRGB") == 0)      components = 3;
+    /* Check if the image is JPEG-encoded (DCTDecode).
+     * For JPEG images, we use the raw stream data and WIC to decode. */
+    if (image_has_jpeg_filter(dict)) {
+        /* For DCTDecode, we need the raw stream data (still JPEG-compressed).
+         * The pdf_decode_stream would have passed it through unchanged via
+         * the "unsupported filter" path. Use raw_data if available. */
+        const uint8_t *jpeg_data = stream->raw_data;
+        size_t jpeg_len = stream->raw_length;
+        if (!jpeg_data || jpeg_len == 0) return;
+
+        int img_w = 0, img_h = 0;
+        HBITMAP hbm = decode_image_wic(ctx->hdc, jpeg_data, jpeg_len,
+                                        &img_w, &img_h);
+        if (hbm) {
+            blit_image_to_dc(ctx, hbm, img_w, img_h);
+            DeleteObject(hbm);
+        }
+        return;
     }
 
-    /* Decode stream data */
+    /* Resolve color space (handles Indexed, ICCBased, etc.) */
+    bool is_indexed = false;
+    uint8_t palette_rgb[256 * 3]; /* up to 256 RGB entries */
+    int palette_count = 0;
+    int components = resolve_image_colorspace(ctx->doc, dict,
+                                              &is_indexed,
+                                              palette_rgb, &palette_count);
+
+    /* Decode stream data (FlateDecode, etc.) */
     if (!stream->decoded_data) {
         if (!pdf_decode_stream(ctx->doc, stream))
             return;
@@ -999,7 +1502,17 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
             size_t dst_idx = ((size_t)py * width + px) * 4;
             uint8_t r, g, b;
 
-            if (components == 1) {
+            if (is_indexed) {
+                /* Index into palette */
+                uint8_t idx = src[src_idx];
+                if (idx < palette_count) {
+                    r = palette_rgb[idx * 3 + 0];
+                    g = palette_rgb[idx * 3 + 1];
+                    b = palette_rgb[idx * 3 + 2];
+                } else {
+                    r = g = b = 0;
+                }
+            } else if (components == 1) {
                 r = g = b = src[src_idx];
             } else if (components == 3) {
                 r = src[src_idx];
@@ -1025,47 +1538,7 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
         }
     }
 
-    /* Compute destination rectangle from CTM.
-     * Images in PDF are defined in a 1x1 unit square at the origin,
-     * and the CTM maps them to the target position and size. */
-    PdfMatrix m = current_gs(ctx)->ctm;
-    double x0, y0, x1, y1, x2, y2, x3, y3;
-    pdf_transform_point(m, 0.0, 0.0, &x0, &y0);
-    pdf_transform_point(m, 1.0, 0.0, &x1, &y1);
-    pdf_transform_point(m, 1.0, 1.0, &x2, &y2);
-    pdf_transform_point(m, 0.0, 1.0, &x3, &y3);
-
-    /* Find bounding box */
-    double min_x = x0, max_x = x0, min_y = y0, max_y = y0;
-    if (x1 < min_x) min_x = x1;
-    if (x1 > max_x) max_x = x1;
-    if (x2 < min_x) min_x = x2;
-    if (x2 > max_x) max_x = x2;
-    if (x3 < min_x) min_x = x3;
-    if (x3 > max_x) max_x = x3;
-    if (y1 < min_y) min_y = y1;
-    if (y1 > max_y) max_y = y1;
-    if (y2 < min_y) min_y = y2;
-    if (y2 > max_y) max_y = y2;
-    if (y3 < min_y) min_y = y3;
-    if (y3 > max_y) max_y = y3;
-
-    int dest_x = (int)(min_x + 0.5);
-    int dest_y = (int)(min_y + 0.5);
-    int dest_w = (int)(max_x - min_x + 0.5);
-    int dest_h = (int)(max_y - min_y + 0.5);
-    if (dest_w < 1) dest_w = 1;
-    if (dest_h < 1) dest_h = 1;
-
-    /* StretchBlt the image to the DC */
-    HDC mem_dc = CreateCompatibleDC(ctx->hdc);
-    HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
-    SetStretchBltMode(ctx->hdc, HALFTONE);
-    SetBrushOrgEx(ctx->hdc, 0, 0, NULL);
-    StretchBlt(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
-               mem_dc, 0, 0, width, height, SRCCOPY);
-    SelectObject(mem_dc, old_bm);
-    DeleteDC(mem_dc);
+    blit_image_to_dc(ctx, hbm, width, height);
     DeleteObject(hbm);
 }
 
