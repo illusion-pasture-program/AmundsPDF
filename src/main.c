@@ -77,6 +77,13 @@ typedef struct {
     int         rendered_page;      /* which page is cached */
     double      rendered_zoom;      /* at what zoom level */
 
+    /* Viewport-aware region rendering */
+    bool        region_mode;        /* true if bitmap is a sub-region, not full page */
+    double      region_x;           /* page-space origin X of rendered bitmap */
+    double      region_y;           /* page-space origin Y of rendered bitmap */
+    double      region_w;           /* page-space width of rendered bitmap */
+    double      region_h;           /* page-space height of rendered bitmap */
+
     /* Scrolling */
     int         scroll_x;
     int         scroll_y;
@@ -472,6 +479,11 @@ static void CloseDocument(void)
     g_app.render_scale = 0.0;
     g_app.rendered_page = -1;
     g_app.rendered_zoom = -1.0;
+    g_app.region_mode = false;
+    g_app.region_x = 0.0;
+    g_app.region_y = 0.0;
+    g_app.region_w = 0.0;
+    g_app.region_h = 0.0;
     g_app.current_page = 0;
     g_app.scroll_x = 0;
     g_app.scroll_y = 0;
@@ -550,6 +562,46 @@ static double CalculateFitWidthZoom(void)
     return z;
 }
 
+/*
+ * Check if the viewport has scrolled close enough to the edge of the
+ * rendered region that we should re-render.  Returns true if the
+ * visible viewport extends within 25% of the rendered region's edge.
+ */
+static bool NeedsRegionRerender(void)
+{
+    if (!g_app.region_mode || !g_app.hPageBitmap) return false;
+
+    RECT rc;
+    GetClientRect(g_app.hWnd, &rc);
+    int cw = rc.right - rc.left;
+    int ch = rc.bottom - rc.top;
+
+    double render_scale = g_app.render_scale;
+    if (render_scale <= 0.0) return false;
+
+    /* Viewport rectangle in page coordinates */
+    double vp_x = (double)(g_app.scroll_x - PAGE_MARGIN) / render_scale;
+    double vp_y = (double)(g_app.scroll_y - PAGE_MARGIN) / render_scale;
+    double vp_w = (double)cw / render_scale;
+    double vp_h = (double)ch / render_scale;
+
+    /* How much padding exists between the viewport edge and the rendered region edge */
+    double pad_left   = vp_x - g_app.region_x;
+    double pad_right  = (g_app.region_x + g_app.region_w) - (vp_x + vp_w);
+    double pad_top    = vp_y - g_app.region_y;
+    double pad_bottom = (g_app.region_y + g_app.region_h) - (vp_y + vp_h);
+
+    /* Trigger re-render if padding on any side is less than 25% of viewport */
+    double thresh_x = vp_w * 0.25;
+    double thresh_y = vp_h * 0.25;
+
+    if (pad_left < thresh_x || pad_right < thresh_x ||
+        pad_top < thresh_y || pad_bottom < thresh_y)
+        return true;
+
+    return false;
+}
+
 static void RenderCurrentPage(void)
 {
     if (!g_app.doc_loaded) return;
@@ -564,7 +616,8 @@ static void RenderCurrentPage(void)
     /* Check if we already have this page rendered at this zoom */
     if (g_app.hPageBitmap &&
         g_app.rendered_page == g_app.current_page &&
-        fabs(g_app.rendered_zoom - effective_zoom) < 0.001)
+        fabs(g_app.rendered_zoom - effective_zoom) < 0.001 &&
+        !NeedsRegionRerender())
         return;
 
     /* Free old bitmap */
@@ -578,19 +631,84 @@ static void RenderCurrentPage(void)
     if (render_scale < MIN_RENDER_SCALE)
         render_scale = MIN_RENDER_SCALE;
 
+    /* Get page dimensions */
+    double page_w_pts = GetPageWidthPts();
+    double page_h_pts = GetPageHeightPts();
+
+    /* Decide whether to use region rendering or full-page rendering.
+     * Use region rendering when the full page at this scale would be
+     * significantly larger than 3x the viewport (i.e., the page is large
+     * relative to the window). */
+    RECT rc;
+    GetClientRect(g_app.hWnd, &rc);
+    int cw = rc.right - rc.left;
+    int ch = rc.bottom - rc.top;
+    if (cw < 1) cw = 1;
+    if (ch < 1) ch = 1;
+
+    bool use_region = (page_w_pts * render_scale > 3.0 * cw) ||
+                      (page_h_pts * render_scale > 3.0 * ch);
+
     int w = 0, h = 0;
-    g_app.hPageBitmap = pdf_render_page(&g_app.doc, g_app.current_page,
-                                         render_scale, &w, &h);
+
+    if (use_region) {
+        /* Compute viewport in page coordinates */
+        double vp_x = (double)(g_app.scroll_x - PAGE_MARGIN) / render_scale;
+        double vp_y = (double)(g_app.scroll_y - PAGE_MARGIN) / render_scale;
+        double vp_w = (double)cw / render_scale;
+        double vp_h = (double)ch / render_scale;
+
+        /* Add 100% padding on each side (total rendered = 3x viewport) */
+        double reg_x = vp_x - vp_w;
+        double reg_y = vp_y - vp_h;
+        double reg_w = vp_w * 3.0;
+        double reg_h = vp_h * 3.0;
+
+        /* Clamp to page bounds */
+        if (reg_x < 0.0) reg_x = 0.0;
+        if (reg_y < 0.0) reg_y = 0.0;
+        if (reg_x + reg_w > page_w_pts) reg_w = page_w_pts - reg_x;
+        if (reg_y + reg_h > page_h_pts) reg_h = page_h_pts - reg_y;
+        if (reg_w < 1.0) reg_w = 1.0;
+        if (reg_h < 1.0) reg_h = 1.0;
+
+        g_app.hPageBitmap = pdf_render_page_region(&g_app.doc, g_app.current_page,
+                                                    render_scale,
+                                                    reg_x, reg_y, reg_w, reg_h,
+                                                    &w, &h);
+
+        g_app.region_mode = true;
+        g_app.region_x = reg_x;
+        g_app.region_y = reg_y;
+        g_app.region_w = reg_w;
+        g_app.region_h = reg_h;
+    } else {
+        g_app.hPageBitmap = pdf_render_page(&g_app.doc, g_app.current_page,
+                                             render_scale, &w, &h);
+
+        g_app.region_mode = false;
+        g_app.region_x = 0.0;
+        g_app.region_y = 0.0;
+        g_app.region_w = page_w_pts;
+        g_app.region_h = page_h_pts;
+    }
 
     if (g_app.hPageBitmap) {
         g_app.page_bmp_w = w;
         g_app.page_bmp_h = h;
         g_app.render_scale = render_scale;
 
-        /* Compute display dimensions (what the user sees at their zoom level) */
+        /* Display dimensions are always the FULL page at user zoom.
+         * The bitmap only covers a region, but the display_w/h represents
+         * the conceptual full-page size for scroll limits and centering. */
         double display_ratio = effective_zoom / render_scale;
-        g_app.display_w = (int)(w * display_ratio + 0.5);
-        g_app.display_h = (int)(h * display_ratio + 0.5);
+        if (!g_app.region_mode) {
+            g_app.display_w = (int)(w * display_ratio + 0.5);
+            g_app.display_h = (int)(h * display_ratio + 0.5);
+        } else {
+            g_app.display_w = (int)(page_w_pts * effective_zoom + 0.5);
+            g_app.display_h = (int)(page_h_pts * effective_zoom + 0.5);
+        }
 
         g_app.rendered_page = g_app.current_page;
         g_app.rendered_zoom = effective_zoom;
@@ -602,6 +720,7 @@ static void RenderCurrentPage(void)
         g_app.render_scale = 0.0;
         g_app.rendered_page = -1;
         g_app.rendered_zoom = -1.0;
+        g_app.region_mode = false;
     }
 
     UpdateScrollLimits();
@@ -946,6 +1065,13 @@ static void PaintWindow(HDC hdc, const RECT *rcClient)
     int cw = rcClient->right - rcClient->left;
     int ch = rcClient->bottom - rcClient->top;
 
+    /* Check if we've scrolled past the region boundary and need a re-render */
+    if (g_app.region_mode && NeedsRegionRerender()) {
+        /* Force re-render centered on current viewport */
+        g_app.rendered_page = -1;
+        RenderCurrentPage();
+    }
+
     /* Fill entire background */
     FillRect(hdc, rcClient, g_app.hBgBrush);
 
@@ -1022,7 +1148,43 @@ static void PaintWindow(HDC hdc, const RECT *rcClient)
     HDC hdcMem = CreateCompatibleDC(hdc);
     HBITMAP hOldBmp = (HBITMAP)SelectObject(hdcMem, g_app.hPageBitmap);
 
-    if (dw != g_app.page_bmp_w || dh != g_app.page_bmp_h) {
+    if (g_app.region_mode) {
+        /*
+         * Region mode: the bitmap covers only a sub-region of the page.
+         * We need to compute where the bitmap should be placed relative
+         * to the page origin, accounting for the region offset.
+         *
+         * render_scale is the scale at which the bitmap was rendered.
+         * effective_zoom is the user-visible zoom level.
+         * display_ratio maps from render pixels to display pixels.
+         */
+        double render_scale = g_app.render_scale;
+        double effective_zoom = g_app.rendered_zoom;
+        double display_ratio = (render_scale > 0.0) ? effective_zoom / render_scale : 1.0;
+
+        /* Where the region starts in display coordinates (relative to page origin) */
+        int region_disp_x = (int)(g_app.region_x * effective_zoom + 0.5);
+        int region_disp_y = (int)(g_app.region_y * effective_zoom + 0.5);
+
+        /* Display size of the rendered region */
+        int region_disp_w = (int)(g_app.page_bmp_w * display_ratio + 0.5);
+        int region_disp_h = (int)(g_app.page_bmp_h * display_ratio + 0.5);
+
+        /* Destination on screen */
+        int dst_x = page_x + region_disp_x;
+        int dst_y = page_y + region_disp_y;
+
+        SetStretchBltMode(hdc, HALFTONE);
+        SetBrushOrgEx(hdc, 0, 0, NULL);
+
+        if (region_disp_w != g_app.page_bmp_w || region_disp_h != g_app.page_bmp_h) {
+            StretchBlt(hdc, dst_x, dst_y, region_disp_w, region_disp_h,
+                       hdcMem, 0, 0, g_app.page_bmp_w, g_app.page_bmp_h, SRCCOPY);
+        } else {
+            BitBlt(hdc, dst_x, dst_y, region_disp_w, region_disp_h,
+                   hdcMem, 0, 0, SRCCOPY);
+        }
+    } else if (dw != g_app.page_bmp_w || dh != g_app.page_bmp_h) {
         /* Oversampled: downscale with high-quality interpolation */
         SetStretchBltMode(hdc, HALFTONE);
         SetBrushOrgEx(hdc, 0, 0, NULL);

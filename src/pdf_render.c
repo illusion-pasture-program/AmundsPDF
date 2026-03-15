@@ -4917,3 +4917,158 @@ HBITMAP pdf_render_page(PdfDocument *doc, int page_idx, double scale,
 
     return hbm;
 }
+
+HBITMAP pdf_render_page_region(PdfDocument *doc, int page_idx, double scale,
+                                double region_x, double region_y,
+                                double region_w, double region_h,
+                                int *out_width, int *out_height)
+{
+    if (!doc || page_idx < 0 || page_idx >= doc->page_count)
+        return NULL;
+    if (scale <= 0.0) scale = 1.0;
+
+    /* Initialize profiling for this page render */
+    prof_reset(page_idx, scale);
+    g_prof.is_region = true;
+
+    /* Get the page dictionary */
+    PdfObj *page = pdf_get_page(doc, page_idx);
+    if (!page) return NULL;
+
+    /* Get page dimensions from MediaBox */
+    double box_x0 = 0, box_y0 = 0, box_x1 = 612, box_y1 = 792; /* Letter default */
+    get_page_box(doc, page, &box_x0, &box_y0, &box_x1, &box_y1);
+
+    double page_w = fabs(box_x1 - box_x0);
+    double page_h = fabs(box_y1 - box_y0);
+    if (page_w < 1.0) page_w = 612.0;
+    if (page_h < 1.0) page_h = 792.0;
+
+    /* Compute pixel dimensions for the REGION (not the full page) */
+    int px_w = (int)(region_w * scale + 0.5);
+    int px_h = (int)(region_h * scale + 0.5);
+    if (px_w < 1) px_w = 1;
+    if (px_h < 1) px_h = 1;
+
+    if (out_width)  *out_width  = px_w;
+    if (out_height) *out_height = px_h;
+
+    /* Record region dimensions for profiling */
+    g_prof.region_px_w = px_w;
+    g_prof.region_px_h = px_h;
+
+    /* Create a memory DC and DIB bitmap */
+    HDC screen_dc = GetDC(NULL);
+    HDC mem_dc = CreateCompatibleDC(screen_dc);
+
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof(bmi));
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = px_w;
+    bmi.bmiHeader.biHeight      = -px_h; /* top-down */
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    void *bits = NULL;
+    HBITMAP hbm = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!hbm) {
+        DeleteDC(mem_dc);
+        ReleaseDC(NULL, screen_dc);
+        return NULL;
+    }
+
+    HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
+
+    /* Fill background with white */
+    RECT rc = { 0, 0, px_w, px_h };
+    HBRUSH white_brush = CreateSolidBrush(RGB(255, 255, 255));
+    FillRect(mem_dc, &rc, white_brush);
+    DeleteObject(white_brush);
+
+    /* Set up GDI defaults */
+    SetBkMode(mem_dc, TRANSPARENT);
+    SetGraphicsMode(mem_dc, GM_ADVANCED);
+    SetStretchBltMode(mem_dc, HALFTONE);
+
+    /* Initialize the render context */
+    PdfRenderCtx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.hdc = mem_dc;
+    ctx.page_width_px = px_w;
+    ctx.page_height_px = px_h;
+    ctx.scale = scale;
+    ctx.page_width = page_w;
+    ctx.page_height = page_h;
+    ctx.doc = doc;
+    ctx.gstate_depth = 0;
+
+    /* Initialize software clip mask dimensions */
+    ctx.clip_mask_w = px_w;
+    ctx.clip_mask_h = px_h;
+
+    /* Initialize graphics state */
+    gs_init(&ctx.gstate[0]);
+
+    /*
+     * Set up the initial CTM for region rendering:
+     *
+     * Like the full-page CTM, we scale and flip Y, but we also translate
+     * so that region_x/region_y maps to the bitmap origin.
+     *
+     * The matrix is:
+     *   [scale    0        -region_x * scale              ]
+     *   [0       -scale     (box_y1 - region_y) * scale   ]
+     *
+     * This maps:
+     *   (region_x, region_y + region_h) -> (0, 0)    [top-left of region -> top of bitmap]
+     *   (region_x + region_w, region_y) -> (px_w, px_h)  [bottom-right of region -> bottom of bitmap]
+     */
+    PdfMatrix initial_ctm;
+    initial_ctm.a = scale;
+    initial_ctm.b = 0.0;
+    initial_ctm.c = 0.0;
+    initial_ctm.d = -scale;
+    initial_ctm.e = -(box_x0 + region_x) * scale;
+    initial_ctm.f = (box_y1 - region_y) * scale;
+
+    ctx.gstate[0].ctm = initial_ctm;
+    ctx.text_matrix = PDF_IDENTITY_MATRIX;
+    ctx.text_line_matrix = PDF_IDENTITY_MATRIX;
+
+    /* Get page resources */
+    PdfDict *resources = get_page_resources(doc, page);
+
+    /* Get and interpret the content stream */
+    uint8_t *content_data = NULL;
+    size_t content_len = 0;
+
+    if (get_page_content(doc, page, &content_data, &content_len)) {
+        if (content_data && content_len > 0 && resources) {
+            PROF_START(interp);
+            interpret_stream(&ctx, resources, content_data, content_len);
+            LARGE_INTEGER interp_end;
+            QueryPerformanceCounter(&interp_end);
+            g_prof.interpret_time += interp_end.QuadPart - interp_prof_start.QuadPart;
+        }
+        free(content_data);
+    }
+
+    /* Free any remaining clip masks on the stack */
+    for (int i = 0; i <= ctx.gstate_depth; i++) {
+        if (ctx.clip_mask_stack[i]) {
+            free(ctx.clip_mask_stack[i]);
+            ctx.clip_mask_stack[i] = NULL;
+        }
+    }
+
+    /* Emit profiling results */
+    prof_emit();
+
+    /* Cleanup */
+    SelectObject(mem_dc, old_bm);
+    DeleteDC(mem_dc);
+    ReleaseDC(NULL, screen_dc);
+
+    return hbm;
+}

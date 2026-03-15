@@ -37,6 +37,11 @@ typedef struct {
     /* Tracking page number and scale for the output line */
     int     page_idx;
     double  scale;
+
+    /* Region rendering info (0 = full page) */
+    int     region_px_w;    /* rendered bitmap width in pixels */
+    int     region_px_h;    /* rendered bitmap height in pixels */
+    bool    is_region;      /* true if this was a region render */
 } RenderProfile;
 
 /* Single global instance, defined in pdf_render.c */
@@ -84,8 +89,11 @@ static inline void prof_reset(int page_idx, double scale)
     g_prof.raster_finish_time = 0;  g_prof.raster_finish_count = 0;
     g_prof.blend_time         = 0;  g_prof.blend_count         = 0;
 
-    g_prof.page_idx = page_idx;
-    g_prof.scale    = scale;
+    g_prof.page_idx    = page_idx;
+    g_prof.scale       = scale;
+    g_prof.region_px_w = 0;
+    g_prof.region_px_h = 0;
+    g_prof.is_region   = false;
 }
 
 /* Convert accumulated ticks to milliseconds */
@@ -111,25 +119,48 @@ static inline void prof_emit(void)
     double blend_ms     = prof_ticks_to_ms(g_prof.blend_time);
 
     char buf[1024];
-    snprintf(buf, sizeof(buf),
-        "[AmundsPDF PERF] Render page %d at %.1fx: %.1fms total\n"
-        "  interpret_stream:  %8.1fms\n"
-        "  path_aa_fill:      %8.1fms  (%d calls)\n"
-        "  path_aa_stroke:    %8.1fms  (%d calls)\n"
-        "  glyph_render:      %8.1fms  (%d calls)\n"
-        "  image_render:      %8.1fms  (%d calls)\n"
-        "  raster_finish:     %8.1fms  (%d calls)\n"
-        "  raster_blend:      %8.1fms  (%d calls)\n",
-        g_prof.page_idx + 1,  /* 1-based for display */
-        g_prof.scale,
-        total_ms,
-        interp_ms,
-        fill_ms,   g_prof.fill_count,
-        stroke_ms, g_prof.stroke_count,
-        glyph_ms,  g_prof.glyph_count,
-        image_ms,  g_prof.image_count,
-        rfinish_ms,g_prof.raster_finish_count,
-        blend_ms,  g_prof.blend_count);
+    if (g_prof.is_region) {
+        snprintf(buf, sizeof(buf),
+            "[AmundsPDF PERF] Render page %d at %.1fx REGION %dx%d: %.1fms total\n"
+            "  interpret_stream:  %8.1fms\n"
+            "  path_aa_fill:      %8.1fms  (%d calls)\n"
+            "  path_aa_stroke:    %8.1fms  (%d calls)\n"
+            "  glyph_render:      %8.1fms  (%d calls)\n"
+            "  image_render:      %8.1fms  (%d calls)\n"
+            "  raster_finish:     %8.1fms  (%d calls)\n"
+            "  raster_blend:      %8.1fms  (%d calls)\n",
+            g_prof.page_idx + 1,  /* 1-based for display */
+            g_prof.scale,
+            g_prof.region_px_w, g_prof.region_px_h,
+            total_ms,
+            interp_ms,
+            fill_ms,   g_prof.fill_count,
+            stroke_ms, g_prof.stroke_count,
+            glyph_ms,  g_prof.glyph_count,
+            image_ms,  g_prof.image_count,
+            rfinish_ms,g_prof.raster_finish_count,
+            blend_ms,  g_prof.blend_count);
+    } else {
+        snprintf(buf, sizeof(buf),
+            "[AmundsPDF PERF] Render page %d at %.1fx: %.1fms total\n"
+            "  interpret_stream:  %8.1fms\n"
+            "  path_aa_fill:      %8.1fms  (%d calls)\n"
+            "  path_aa_stroke:    %8.1fms  (%d calls)\n"
+            "  glyph_render:      %8.1fms  (%d calls)\n"
+            "  image_render:      %8.1fms  (%d calls)\n"
+            "  raster_finish:     %8.1fms  (%d calls)\n"
+            "  raster_blend:      %8.1fms  (%d calls)\n",
+            g_prof.page_idx + 1,  /* 1-based for display */
+            g_prof.scale,
+            total_ms,
+            interp_ms,
+            fill_ms,   g_prof.fill_count,
+            stroke_ms, g_prof.stroke_count,
+            glyph_ms,  g_prof.glyph_count,
+            image_ms,  g_prof.image_count,
+            rfinish_ms,g_prof.raster_finish_count,
+            blend_ms,  g_prof.blend_count);
+    }
 
     OutputDebugStringA(buf);
 
