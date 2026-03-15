@@ -1467,6 +1467,7 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
     /* Now stroke each line segment as a filled quad */
     double prev_x = 0, prev_y = 0;
     double subpath_start_x = 0, subpath_start_y = 0;
+    bool first_in_subpath = true;  /* true until we've drawn the first segment after a moveto */
 
     for (int i = 0; i < flat_count; i++) {
         if (flat_cmd[i] == 0) {
@@ -1475,6 +1476,7 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
             prev_y = flat_y[i];
             subpath_start_x = prev_x;
             subpath_start_y = prev_y;
+            first_in_subpath = true;
             continue;
         }
 
@@ -1489,6 +1491,11 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
         double dy = y1 - y0;
         double len = sqrt(dx * dx + dy * dy);
 
+        /* Is this the last segment in the subpath? */
+        bool is_last = (i + 1 >= flat_count || flat_cmd[i + 1] == 0 || flat_cmd[i] == 2);
+        /* Is this an open subpath end? (not a close command) */
+        bool is_open_end = is_last && flat_cmd[i] != 2;
+
         if (len > 1e-10) {
             /* Perpendicular offset: rotate direction 90 degrees */
             double nx = (-dy / len) * half_w;
@@ -1502,9 +1509,9 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
             raster_close(rctx);
 
             /* Line join handling at junction points.
-             * At the start of each line segment (x0,y0), draw join geometry
-             * connecting this segment to the previous one. */
-            if (gs->line_join == 1) {
+             * Joins only apply at points where two segments CONNECT —
+             * NOT at the start of a subpath (moveto point). */
+            if (!first_in_subpath && gs->line_join == 1) {
                 /* Round join: draw a filled circle at the junction point.
                  * Use adaptive segment count based on radius for quality. */
                 int n_circle = (int)(half_w * 4.0);
@@ -1520,15 +1527,25 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
                 raster_close(rctx);
             }
 
-            /* Line caps at the end of open subpaths */
+            /* Line caps: round/square caps at the START and END of open subpaths.
+             * Caps extend the stroke beyond the endpoint by half_w. */
             if (gs->line_cap == 1) {
-                /* Round cap: draw a filled semicircle at the end of open subpaths.
-                 * Use adaptive segment count based on radius. */
                 int n_circle = (int)(half_w * 4.0);
                 if (n_circle < 12) n_circle = 12;
                 if (n_circle > 64) n_circle = 64;
-                /* Only add end cap for the last segment in a subpath */
-                if (i + 1 >= flat_count || flat_cmd[i + 1] == 0 || flat_cmd[i] == 2) {
+                /* Start cap: only for the first segment in an open subpath */
+                if (first_in_subpath) {
+                    for (int c = 0; c < n_circle; c++) {
+                        double angle = 2.0 * 3.14159265358979323846 * c / n_circle;
+                        double ccx = x0 + cos(angle) * half_w;
+                        double ccy = y0 + sin(angle) * half_w;
+                        if (c == 0) raster_move_to(rctx, ccx, ccy);
+                        else raster_line_to(rctx, ccx, ccy);
+                    }
+                    raster_close(rctx);
+                }
+                /* End cap: only at the end of an open subpath */
+                if (is_open_end) {
                     for (int c = 0; c < n_circle; c++) {
                         double angle = 2.0 * 3.14159265358979323846 * c / n_circle;
                         double ccx = x1 + cos(angle) * half_w;
@@ -1539,10 +1556,18 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
                     raster_close(rctx);
                 }
             } else if (gs->line_cap == 2) {
-                /* Square cap: extend the line by half_w */
                 double ext_x = (dx / len) * half_w;
                 double ext_y = (dy / len) * half_w;
-                if (i + 1 >= flat_count || flat_cmd[i + 1] == 0 || flat_cmd[i] == 2) {
+                /* Start square cap */
+                if (first_in_subpath) {
+                    raster_move_to(rctx, x0 + nx - ext_x, y0 + ny - ext_y);
+                    raster_line_to(rctx, x0 - nx - ext_x, y0 - ny - ext_y);
+                    raster_line_to(rctx, x0 - nx, y0 - ny);
+                    raster_line_to(rctx, x0 + nx, y0 + ny);
+                    raster_close(rctx);
+                }
+                /* End square cap */
+                if (is_open_end) {
                     raster_move_to(rctx, x1 + nx + ext_x, y1 + ny + ext_y);
                     raster_line_to(rctx, x1 - nx + ext_x, y1 - ny + ext_y);
                     raster_line_to(rctx, x1 - nx, y1 - ny);
@@ -1552,6 +1577,7 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
             }
         }
 
+        first_in_subpath = false;
         prev_x = flat_x[i];
         prev_y = flat_y[i];
 
@@ -3204,57 +3230,127 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
 
         if (is_image_mask) {
             /* ImageMask: render as stencil with current fill color.
-             * Painted pixels use fill color, transparent pixels use magenta key. */
-            PdfColor fill = current_gs(ctx)->fill_color;
-            uint8_t fr = (uint8_t)(fill.r * 255.0 + 0.5);
-            uint8_t fg = (uint8_t)(fill.g * 255.0 + 0.5);
-            uint8_t fb = (uint8_t)(fill.b * 255.0 + 0.5);
+             * Use 4x4 sub-pixel sampling for anti-aliased edges.
+             * For each destination pixel, sample the source bitmap at 16 sub-pixel
+             * positions and use the coverage count as alpha for blending. */
+            DeleteObject(hbm); /* don't need the pre-allocated DIB */
 
-            /* Choose a transparent key color that differs from fill */
-            uint8_t tr_r = 255, tr_g = 0, tr_b = 255; /* magenta */
-            if (fr == 255 && fg == 0 && fb == 255) {
-                tr_r = 0; tr_g = 255; tr_b = 0; /* green fallback */
+            PdfColor fill = current_gs(ctx)->fill_color;
+            int fr = (int)(fill.r * 255.0 + 0.5);
+            int fg = (int)(fill.g * 255.0 + 0.5);
+            int fb = (int)(fill.b * 255.0 + 0.5);
+
+            int dest_x, dest_y, dest_w, dest_h;
+            compute_image_dest_rect(ctx, &dest_x, &dest_y, &dest_w, &dest_h);
+            if (dest_w <= 0 || dest_h <= 0) return;
+
+            /* Get page bitmap for direct pixel access */
+            int page_w, page_h, page_stride;
+            uint8_t *page_bits = get_page_bits(ctx->hdc, &page_w, &page_h, &page_stride);
+            if (!page_bits) {
+                /* Fallback: use the old TransparentBlt approach without AA */
+                hbm = CreateDIBSection(ctx->hdc, &bmi, DIB_RGB_COLORS,
+                                       (void **)&dib_bits, NULL, 0);
+                if (!hbm || !dib_bits) { if (hbm) DeleteObject(hbm); return; }
+                uint8_t tr_r = 255, tr_g = 0, tr_b = 255;
+                if (fr == 255 && fg == 0 && fb == 255) { tr_r = 0; tr_g = 255; tr_b = 0; }
+                for (int py = 0; py < height; py++) {
+                    const uint8_t *row = src + (size_t)py * row_bytes;
+                    for (int px = 0; px < width; px++) {
+                        int byte_idx = px / 8;
+                        int bit_idx = 7 - (px % 8);
+                        int bit = (row[byte_idx] >> bit_idx) & 1;
+                        bool painted = decode_inverted ? (bit == 1) : (bit == 0);
+                        size_t dst_idx = ((size_t)py * width + px) * 4;
+                        if (painted) {
+                            dib_bits[dst_idx+0]=(uint8_t)fb; dib_bits[dst_idx+1]=(uint8_t)fg;
+                            dib_bits[dst_idx+2]=(uint8_t)fr; dib_bits[dst_idx+3]=255;
+                        } else {
+                            dib_bits[dst_idx+0]=tr_b; dib_bits[dst_idx+1]=tr_g;
+                            dib_bits[dst_idx+2]=tr_r; dib_bits[dst_idx+3]=255;
+                        }
+                    }
+                }
+                HDC mem_dc = CreateCompatibleDC(ctx->hdc);
+                HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
+                SetStretchBltMode(ctx->hdc, COLORONCOLOR);
+                TransparentBlt(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
+                               mem_dc, 0, 0, width, height, RGB(tr_r, tr_g, tr_b));
+                SelectObject(mem_dc, old_bm);
+                DeleteDC(mem_dc);
+                DeleteObject(hbm);
+                return;
             }
 
-            for (int py = 0; py < height; py++) {
-                const uint8_t *row = src + (size_t)py * row_bytes;
-                for (int px = 0; px < width; px++) {
-                    int byte_idx = px / 8;
-                    int bit_idx = 7 - (px % 8); /* MSB first */
-                    int bit = (row[byte_idx] >> bit_idx) & 1;
+            GdiFlush();
 
-                    /* Default Decode [0 1]: bit 0 -> painted, bit 1 -> transparent
-                     * Inverted Decode [1 0]: bit 1 -> painted, bit 0 -> transparent */
-                    bool painted = decode_inverted ? (bit == 1) : (bit == 0);
+            /* Box-filter anti-aliasing: for each destination pixel, count all
+             * source pixels that map to it and use the painted fraction as alpha.
+             * This properly handles any scale ratio (both down and up scaling).
+             *
+             * For downscaling (e.g., 3753→864): each dest pixel covers ~4.3 source
+             * pixels per axis, and we count all ~18 source pixels for accurate AA.
+             * For upscaling: falls back to point sampling (1 source per dest). */
+            for (int dy = 0; dy < dest_h; dy++) {
+                int py = dest_y + dy;
+                if (py < 0 || py >= page_h) continue;
+                uint8_t *page_row = page_bits + py * page_stride;
 
-                    size_t dst_idx = ((size_t)py * width + px) * 4;
-                    if (painted) {
-                        dib_bits[dst_idx + 0] = fb;
-                        dib_bits[dst_idx + 1] = fg;
-                        dib_bits[dst_idx + 2] = fr;
-                        dib_bits[dst_idx + 3] = 255;
+                /* Source Y range covered by this dest pixel row */
+                int src_y0 = (int)((double)dy / dest_h * height);
+                int src_y1 = (int)((double)(dy + 1) / dest_h * height);
+                if (src_y1 <= src_y0) src_y1 = src_y0 + 1;
+                if (src_y0 < 0) src_y0 = 0;
+                if (src_y1 > height) src_y1 = height;
+
+                for (int dx = 0; dx < dest_w; dx++) {
+                    int ppx = dest_x + dx;
+                    if (ppx < 0 || ppx >= page_w) continue;
+
+                    /* Source X range covered by this dest pixel column */
+                    int src_x0 = (int)((double)dx / dest_w * width);
+                    int src_x1 = (int)((double)(dx + 1) / dest_w * width);
+                    if (src_x1 <= src_x0) src_x1 = src_x0 + 1;
+                    if (src_x0 < 0) src_x0 = 0;
+                    if (src_x1 > width) src_x1 = width;
+
+                    /* Count painted source pixels in this area */
+                    int painted = 0;
+                    int total = 0;
+                    for (int iy = src_y0; iy < src_y1; iy++) {
+                        const uint8_t *srow = src + (size_t)iy * row_bytes;
+                        for (int ix = src_x0; ix < src_x1; ix++) {
+                            int byte_idx = ix / 8;
+                            int bit_idx = 7 - (ix % 8);
+                            int bit = (srow[byte_idx] >> bit_idx) & 1;
+                            bool is_painted = decode_inverted ? (bit == 1) : (bit == 0);
+                            if (is_painted) painted++;
+                            total++;
+                        }
+                    }
+
+                    if (painted == 0) continue;
+
+                    /* Convert coverage to alpha (0-255) */
+                    int alpha = (total > 0) ? (painted * 255 / total) : 0;
+                    if (alpha > 255) alpha = 255;
+
+                    /* Alpha blend fill color onto page pixel */
+                    uint8_t *pixel = page_row + ppx * 4;
+                    if (alpha >= 255) {
+                        pixel[0] = (uint8_t)fb;
+                        pixel[1] = (uint8_t)fg;
+                        pixel[2] = (uint8_t)fr;
+                        pixel[3] = 255;
                     } else {
-                        dib_bits[dst_idx + 0] = tr_b;
-                        dib_bits[dst_idx + 1] = tr_g;
-                        dib_bits[dst_idx + 2] = tr_r;
-                        dib_bits[dst_idx + 3] = 255;
+                        int inv = 255 - alpha;
+                        pixel[0] = (uint8_t)((fb * alpha + pixel[0] * inv + 127) / 255);
+                        pixel[1] = (uint8_t)((fg * alpha + pixel[1] * inv + 127) / 255);
+                        pixel[2] = (uint8_t)((fr * alpha + pixel[2] * inv + 127) / 255);
+                        pixel[3] = 255;
                     }
                 }
             }
-
-            /* Blit with transparency using TransparentBlt */
-            int dest_x, dest_y, dest_w, dest_h;
-            compute_image_dest_rect(ctx, &dest_x, &dest_y, &dest_w, &dest_h);
-
-            HDC mem_dc = CreateCompatibleDC(ctx->hdc);
-            HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
-            SetStretchBltMode(ctx->hdc, COLORONCOLOR);
-            COLORREF trans_color = RGB(tr_r, tr_g, tr_b);
-            TransparentBlt(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
-                           mem_dc, 0, 0, width, height, trans_color);
-            SelectObject(mem_dc, old_bm);
-            DeleteDC(mem_dc);
-            DeleteObject(hbm);
         } else {
             /* Regular 1-bit grayscale image (not a mask).
              * Default Decode [0 1]: bit 0 -> black (0), bit 1 -> white (255)
