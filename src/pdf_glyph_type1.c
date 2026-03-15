@@ -977,20 +977,37 @@ static bool t1_execute(T1Interp *interp, const uint8_t *data, size_t len)
                      *   1 = start flex
                      *   2 = add flex point
                      *   3 = hint replacement (push current point)
+                     *
+                     * Per the Type 1 spec, callothersubr pops othersubr# and n,
+                     * then transfers n arguments from the Type 1 operand stack
+                     * to the PostScript interpreter stack. This transfer happens
+                     * for ALL othersubrs before the specific handler runs.
                      */
                     if (interp->sp >= 2) {
                         int othersubr = (int)interp->stack[--interp->sp];
                         int n_args = (int)interp->stack[--interp->sp];
 
+                        /* Transfer n_args from T1 stack to PS stack (standard behavior).
+                         * Args are popped from T1 stack (LIFO) and pushed to PS stack. */
+                        for (int i = 0; i < n_args && interp->sp > 0; i++) {
+                            double val = interp->stack[--interp->sp];
+                            if (interp->ps_sp < T1_MAX_OTHER_ARGS)
+                                interp->ps_stack[interp->ps_sp++] = val;
+                        }
+
                         switch (othersubr) {
                             case 0: {
-                                /* End flex: args are fd (flex depth) on the stack,
-                                 * plus the 7 points collected during flex.
-                                 * We emit two cubic curves. */
+                                /* End flex: the 3 args (epy, epx, fd) were already
+                                 * transferred to the PS stack above.
+                                 * We emit two cubic curves from the 7 flex points. */
                                 interp->in_flex = false;
 
-                                /* Pop fd argument from stack */
-                                if (interp->sp >= 1) interp->sp--;
+                                /* Clear the transferred args from PS stack
+                                 * (fd, epx, epy are not needed - we use flex_pts) */
+                                if (interp->ps_sp >= n_args)
+                                    interp->ps_sp -= n_args;
+                                else
+                                    interp->ps_sp = 0;
 
                                 /* The flex points are:
                                  *  0: reference point (start)
@@ -1036,11 +1053,15 @@ static bool t1_execute(T1Interp *interp, const uint8_t *data, size_t len)
                                     interp->y = y6;
                                 }
 
-                                /* Push results to PS stack (epx, epy for setcurrentpoint) */
-                                if (interp->ps_sp < T1_MAX_OTHER_ARGS)
-                                    interp->ps_stack[interp->ps_sp++] = interp->x;
+                                /* Push results to PS stack for pop/pop/setcurrentpoint.
+                                 * Push y first, then x, so that:
+                                 *   pop -> gets x (top of PS stack) -> T1 stack[0]
+                                 *   pop -> gets y -> T1 stack[1]
+                                 *   setcurrentpoint reads stack[0]=x, stack[1]=y */
                                 if (interp->ps_sp < T1_MAX_OTHER_ARGS)
                                     interp->ps_stack[interp->ps_sp++] = interp->y;
+                                if (interp->ps_sp < T1_MAX_OTHER_ARGS)
+                                    interp->ps_stack[interp->ps_sp++] = interp->x;
                                 break;
                             }
 
@@ -1060,18 +1081,14 @@ static bool t1_execute(T1Interp *interp, const uint8_t *data, size_t len)
                                 break;
 
                             case 3:
-                                /* Hint replacement: push current point to PS stack */
-                                if (interp->ps_sp < T1_MAX_OTHER_ARGS)
-                                    interp->ps_stack[interp->ps_sp++] = interp->x;
+                                /* Hint replacement: the 1 arg was already transferred
+                                 * to PS stack by the generic code above. That's exactly
+                                 * what we need - the subsequent 'pop' in the calling
+                                 * subroutine will retrieve it. Nothing else to do. */
                                 break;
 
                             default:
-                                /* Unknown othersubr: pop n_args from stack to PS stack */
-                                for (int i = 0; i < n_args && interp->sp > 0; i++) {
-                                    double val = interp->stack[--interp->sp];
-                                    if (interp->ps_sp < T1_MAX_OTHER_ARGS)
-                                        interp->ps_stack[interp->ps_sp++] = val;
-                                }
+                                /* Unknown othersubr: args already transferred above */
                                 break;
                         }
                     }

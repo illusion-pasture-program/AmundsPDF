@@ -1139,6 +1139,7 @@ bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
         bool got_glyph = false;
         int resolved_gid = -1;
 
+
         if (enc_map && (font->is_cff || font->is_type1)) {
             /* PDF encoding resolution path:
              * char_code -> glyph_name (via PDF /Encoding)
@@ -1158,6 +1159,9 @@ bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
             /* Fallback: use the font's built-in encoding */
             got_glyph = parsed_font_get_glyph(font, char_code, &outline);
         }
+
+
+
 
         if (got_glyph && outline.count > 0 && gs->text_render_mode != 3) {
             /* Compute combined matrix: text_matrix * CTM */
