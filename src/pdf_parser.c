@@ -2295,10 +2295,19 @@ bool pdf_decode_stream(PdfDocument *doc, PdfStream *stream) {
             int rows = 0;
             int k_val = 0;      /* K=0 is Group 3 1D, K<0 is Group 4, K>0 is mixed */
 
+            bool black_is_1 = false; /* PDF default: 0=black, 1=white */
+
             if (ccitt_parms) {
                 columns = pdf_dict_get_int(ccitt_parms, "Columns", 1728);
                 rows = pdf_dict_get_int(ccitt_parms, "Rows", 0);
                 k_val = pdf_dict_get_int(ccitt_parms, "K", 0);
+                /* BlackIs1: if true, 1=black (CCITT natural); if false, invert */
+                PdfObj *bi1 = pdf_dict_get(ccitt_parms, "BlackIs1");
+                if (bi1) {
+                    bi1 = pdf_resolve(doc, bi1);
+                    if (bi1 && bi1->type == PDF_OBJ_BOOL)
+                        black_is_1 = bi1->boolean;
+                }
             }
 
             /* Also try to get height from the stream dict if Rows not in DecodeParms */
@@ -2318,6 +2327,13 @@ bool pdf_decode_stream(PdfDocument *doc, PdfStream *stream) {
                     if (own_data) free(current_data);
                     return false;
                 }
+            /* If BlackIs1 is false (default), the CCITT decoder outputs
+             * white=0, black=1 but the PDF expects 0=black, 1=white.
+             * Invert all bits to match PDF convention. */
+            if (!black_is_1 && out && out_len > 0) {
+                for (size_t j = 0; j < out_len; j++)
+                    out[j] = ~out[j];
+            }
             } else {
                 /* Group 3 (K=0 or K>0) - not yet implemented, pass through */
                 out = (uint8_t *)malloc(current_len);
