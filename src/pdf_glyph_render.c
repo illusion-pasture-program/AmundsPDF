@@ -1114,11 +1114,10 @@ bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
     for (size_t i = 0; i < len; i++) {
         int char_code = str[i];
 
-        /* Skip control characters (0x00-0x1F).
-         * These are not renderable in any standard PDF encoding.
-         * Some PDFs embed CR/LF (0x0D/0x0A) within text strings as
-         * line-break hints; they should not produce visible glyphs. */
-        if (char_code < 0x20 && char_code != 0) {
+        /* Skip only true null characters. DO NOT skip 0x01-0x1F because
+         * many PDF fonts (especially LaTeX math fonts like CMSY10) use codes
+         * below 0x20 for valid glyphs (∼, ×, ±, ∞, etc.). */
+        if (char_code == 0) {
             /* Still advance text position using the font's width for this code,
              * but do not render a glyph. */
             double advance_width = parsed_font_get_advance(font, char_code);

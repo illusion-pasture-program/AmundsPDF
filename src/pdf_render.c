@@ -1811,9 +1811,9 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
         /* Skip invisible text rendering mode */
         if (gs->text_render_mode == 3) {
             /* Still advance position */
-        } else if (char_code >= 0x20 || char_code == 0) {
-            /* Compute device position from text matrix * CTM.
-             * Apply text rise: shift vertically in text space by gs->text_rise */
+        } else if (char_code != 0) {
+            /* Render all non-null characters. DO NOT skip codes below 0x20
+             * because many fonts (especially LaTeX math) use them for valid glyphs. */
             PdfMatrix combined = pdf_matrix_multiply(ctx->text_matrix, gs->ctm);
             double ox, oy;
             pdf_transform_point(combined, 0, gs->text_rise, &ox, &oy);
