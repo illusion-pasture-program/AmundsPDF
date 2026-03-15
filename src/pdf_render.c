@@ -1510,15 +1510,18 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
 
             /* Line join handling at junction points.
              * Joins only apply at points where two segments CONNECT —
-             * NOT at the start of a subpath (moveto point). */
+             * NOT at the start of a subpath (moveto point).
+             * Round joins draw a semicircular arc on the OUTSIDE of the bend
+             * to smoothly connect the outer edges of adjacent quads. */
             if (!first_in_subpath && gs->line_join == 1) {
-                /* Round join: draw a filled circle at the junction point.
-                 * Use adaptive segment count based on radius for quality. */
-                int n_circle = (int)(half_w * 4.0);
-                if (n_circle < 12) n_circle = 12;
-                if (n_circle > 64) n_circle = 64;
-                for (int c = 0; c < n_circle; c++) {
-                    double angle = 2.0 * 3.14159265358979323846 * c / n_circle;
+                /* Round join: draw a semicircular arc at the junction.
+                 * Use a full circle here since the rasterizer's nonzero winding
+                 * rule correctly handles the overlap with adjacent quads. */
+                int n_arc = (int)(half_w * 3.0);
+                if (n_arc < 8) n_arc = 8;
+                if (n_arc > 48) n_arc = 48;
+                for (int c = 0; c < n_arc; c++) {
+                    double angle = 2.0 * 3.14159265358979323846 * c / n_arc;
                     double cx = x0 + cos(angle) * half_w;
                     double cy = y0 + sin(angle) * half_w;
                     if (c == 0) raster_move_to(rctx, cx, cy);
@@ -1528,31 +1531,43 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
             }
 
             /* Line caps: round/square caps at the START and END of open subpaths.
-             * Caps extend the stroke beyond the endpoint by half_w. */
+             * Round caps are rendered as SEMICIRCLES extending beyond the endpoint,
+             * NOT as full circles. This avoids overlap artifacts with the quad.
+             * The semicircle connects the two perpendicular edges of the quad and
+             * passes through the point half_w beyond the endpoint. */
             if (gs->line_cap == 1) {
-                int n_circle = (int)(half_w * 4.0);
-                if (n_circle < 12) n_circle = 12;
-                if (n_circle > 64) n_circle = 64;
-                /* Start cap: only for the first segment in an open subpath */
+                int n_half = (int)(half_w * 3.0);
+                if (n_half < 6) n_half = 6;
+                if (n_half > 32) n_half = 32;
+                double dir_x = dx / len;  /* unit direction vector along segment */
+                double dir_y = dy / len;
+
+                /* Start cap: semicircle extending BACKWARD from start point */
                 if (first_in_subpath) {
-                    for (int c = 0; c < n_circle; c++) {
-                        double angle = 2.0 * 3.14159265358979323846 * c / n_circle;
-                        double ccx = x0 + cos(angle) * half_w;
-                        double ccy = y0 + sin(angle) * half_w;
-                        if (c == 0) raster_move_to(rctx, ccx, ccy);
-                        else raster_line_to(rctx, ccx, ccy);
+                    /* Start from one perpendicular edge, arc backward, end at other edge */
+                    raster_move_to(rctx, x0 + nx, y0 + ny);
+                    for (int c = 1; c <= n_half; c++) {
+                        /* Arc from perpendicular+ through backward to perpendicular- */
+                        double t = 3.14159265358979323846 * c / n_half;
+                        /* Rotate: start at perp direction, sweep π radians backward */
+                        double ax = nx * cos(t) + (-dir_x * half_w) * sin(t);
+                        double ay = ny * cos(t) + (-dir_y * half_w) * sin(t);
+                        raster_line_to(rctx, x0 + ax, y0 + ay);
                     }
+                    /* Close back through the quad edge (straight line across) */
+                    raster_line_to(rctx, x0 + nx, y0 + ny);
                     raster_close(rctx);
                 }
-                /* End cap: only at the end of an open subpath */
+                /* End cap: semicircle extending FORWARD from end point */
                 if (is_open_end) {
-                    for (int c = 0; c < n_circle; c++) {
-                        double angle = 2.0 * 3.14159265358979323846 * c / n_circle;
-                        double ccx = x1 + cos(angle) * half_w;
-                        double ccy = y1 + sin(angle) * half_w;
-                        if (c == 0) raster_move_to(rctx, ccx, ccy);
-                        else raster_line_to(rctx, ccx, ccy);
+                    raster_move_to(rctx, x1 + nx, y1 + ny);
+                    for (int c = 1; c <= n_half; c++) {
+                        double t = 3.14159265358979323846 * c / n_half;
+                        double ax = nx * cos(t) + (dir_x * half_w) * sin(t);
+                        double ay = ny * cos(t) + (dir_y * half_w) * sin(t);
+                        raster_line_to(rctx, x1 + ax, y1 + ay);
                     }
+                    raster_line_to(rctx, x1 + nx, y1 + ny);
                     raster_close(rctx);
                 }
             } else if (gs->line_cap == 2) {
