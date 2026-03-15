@@ -11,6 +11,7 @@
 #include "pdf_parser.h"
 #include "pdf_fonts.h"
 #include "pdf_glyph_render.h"
+#include "pdf_raster.h"
 #include <objbase.h>  /* CoInitializeEx, CoCreateInstance for WIC image decoding */
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -519,6 +520,15 @@ static void transform_point(PdfRenderCtx *ctx, double x, double y,
     *dy = (int)(oy + 0.5);
 }
 
+/* Same as transform_point but returns double-precision device coordinates.
+ * Used by the software rasterizer path to avoid integer truncation. */
+static void transform_point_d(PdfRenderCtx *ctx, double x, double y,
+                               double *dx, double *dy)
+{
+    PdfMatrix m = current_gs(ctx)->ctm;
+    pdf_transform_point(m, x, y, dx, dy);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Path Building
  * ═══════════════════════════════════════════════════════════════════════════
@@ -531,12 +541,17 @@ static void transform_point(PdfRenderCtx *ctx, double x, double y,
 #define MAX_PATH_POINTS 16384
 
 typedef struct {
-    POINT  pts[MAX_PATH_POINTS];
-    BYTE   types[MAX_PATH_POINTS];  /* PT_MOVETO, PT_LINETO, PT_BEZIERTO */
-    int    count;
-    double cur_x, cur_y;    /* current point in user space */
-    double start_x, start_y; /* start of current subpath */
-    bool   has_current;
+    double x, y;    /* double-precision device coordinates */
+} DPoint;
+
+typedef struct {
+    POINT   pts[MAX_PATH_POINTS];
+    DPoint  dpts[MAX_PATH_POINTS];  /* double-precision device coordinates (for software rasterizer) */
+    BYTE    types[MAX_PATH_POINTS]; /* PT_MOVETO, PT_LINETO, PT_BEZIERTO */
+    int     count;
+    double  cur_x, cur_y;    /* current point in user space */
+    double  start_x, start_y; /* start of current subpath */
+    bool    has_current;
 } PathBuilder;
 
 static void path_reset(PathBuilder *pb)
@@ -552,9 +567,13 @@ static void path_add_point(PathBuilder *pb, PdfRenderCtx *ctx,
 {
     if (pb->count >= MAX_PATH_POINTS) return;
     int dx, dy;
+    double ddx, ddy;
     transform_point(ctx, x, y, &dx, &dy);
+    transform_point_d(ctx, x, y, &ddx, &ddy);
     pb->pts[pb->count].x = dx;
     pb->pts[pb->count].y = dy;
+    pb->dpts[pb->count].x = ddx;
+    pb->dpts[pb->count].y = ddy;
     pb->types[pb->count] = type;
     pb->count++;
 }
@@ -616,7 +635,440 @@ static void path_rect(PathBuilder *pb, PdfRenderCtx *ctx,
 }
 
 /*
- * Render the accumulated path using GDI.
+ * Helper: compute bounding box of the double-precision path points.
+ * Returns false if the path is empty.
+ */
+static bool path_bbox(PathBuilder *pb, double *min_x, double *min_y,
+                       double *max_x, double *max_y)
+{
+    if (pb->count == 0) return false;
+
+    *min_x = 1e30;  *min_y = 1e30;
+    *max_x = -1e30; *max_y = -1e30;
+
+    for (int i = 0; i < pb->count; i++) {
+        double px = pb->dpts[i].x;
+        double py = pb->dpts[i].y;
+        if (px < *min_x) *min_x = px;
+        if (py < *min_y) *min_y = py;
+        if (px > *max_x) *max_x = px;
+        if (py > *max_y) *max_y = py;
+    }
+    return (*max_x > *min_x) && (*max_y > *min_y);
+}
+
+/*
+ * Helper: get the page bitmap's raw pixel data for software blending.
+ * Returns the pixel pointer and fills in page dimensions + stride.
+ * Falls back to a temporary DIB if the HDC bitmap is not a DIB section.
+ */
+static uint8_t *get_page_bits(HDC hdc, int *page_w, int *page_h, int *page_stride)
+{
+    HBITMAP hbm = (HBITMAP)GetCurrentObject(hdc, OBJ_BITMAP);
+    if (!hbm) return NULL;
+
+    DIBSECTION ds;
+    if (GetObject(hbm, sizeof(DIBSECTION), &ds) == 0 || !ds.dsBm.bmBits)
+        return NULL;
+
+    *page_w = ds.dsBm.bmWidth;
+    *page_h = abs(ds.dsBm.bmHeight);
+    *page_stride = ds.dsBm.bmWidthBytes;
+    return (uint8_t *)ds.dsBm.bmBits;
+}
+
+/*
+ * Software AA fill: replay path into rasterizer and blend onto page bitmap.
+ * Returns true on success, false if fallback to GDI is needed.
+ */
+static bool path_aa_fill(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
+{
+    /* Compute bounding box of the path in device pixels */
+    double bmin_x, bmin_y, bmax_x, bmax_y;
+    if (!path_bbox(pb, &bmin_x, &bmin_y, &bmax_x, &bmax_y))
+        return false;
+
+    /* Add 2px padding for anti-aliasing edges */
+    bmin_x = floor(bmin_x) - 2.0;
+    bmin_y = floor(bmin_y) - 2.0;
+    bmax_x = ceil(bmax_x) + 2.0;
+    bmax_y = ceil(bmax_y) + 2.0;
+
+    int rw = (int)(bmax_x - bmin_x);
+    int rh = (int)(bmax_y - bmin_y);
+
+    /* Sanity check: rasterizer has size limits */
+    if (rw <= 0 || rh <= 0) return false;
+    if (rw > 16384 || rh > 16384) return false;
+
+    RasterCtx *rctx = raster_create(rw, rh);
+    if (!rctx) return false;
+
+    /* Replay path through rasterizer using double coordinates */
+    for (int i = 0; i < pb->count; i++) {
+        BYTE t = pb->types[i] & ~PT_CLOSEFIGURE;
+        bool close = (pb->types[i] & PT_CLOSEFIGURE) != 0;
+
+        double px = pb->dpts[i].x - bmin_x;
+        double py = pb->dpts[i].y - bmin_y;
+
+        if (t == PT_MOVETO) {
+            raster_move_to(rctx, px, py);
+        } else if (t == PT_LINETO) {
+            raster_line_to(rctx, px, py);
+        } else if (t == PT_BEZIERTO) {
+            if (i + 2 < pb->count) {
+                double cx1 = pb->dpts[i].x - bmin_x;
+                double cy1 = pb->dpts[i].y - bmin_y;
+                double cx2 = pb->dpts[i+1].x - bmin_x;
+                double cy2 = pb->dpts[i+1].y - bmin_y;
+                double ex  = pb->dpts[i+2].x - bmin_x;
+                double ey  = pb->dpts[i+2].y - bmin_y;
+                raster_curve_to(rctx, cx1, cy1, cx2, cy2, ex, ey);
+                i += 2;
+            }
+        }
+
+        if (close) {
+            raster_close(rctx);
+        }
+    }
+
+    /* Compute coverage with the appropriate fill rule */
+    if (ops & 4) {
+        raster_finish_evenodd(rctx);
+    } else {
+        raster_finish(rctx);
+    }
+
+    /* Get page bitmap pixels */
+    HDC hdc = ctx->hdc;
+    int page_w, page_h, page_stride;
+    uint8_t *page_bits = get_page_bits(hdc, &page_w, &page_h, &page_stride);
+
+    PdfGraphicsState *gs = current_gs(ctx);
+    COLORREF fill_col = pdf_color_to_gdi(gs->fill_color);
+    int fr = GetRValue(fill_col);
+    int fg = GetGValue(fill_col);
+    int fb = GetBValue(fill_col);
+
+    int dest_x = (int)bmin_x;
+    int dest_y = (int)bmin_y;
+
+    if (page_bits) {
+        /* Direct pixel access to the page bitmap */
+        GdiFlush();
+        raster_blend(rctx, page_bits, page_stride, page_w, page_h,
+                     dest_x, dest_y, fr, fg, fb);
+    } else {
+        /* Fallback: read pixels via BitBlt, blend, write back */
+        BITMAPINFO out_bmi;
+        memset(&out_bmi, 0, sizeof(out_bmi));
+        out_bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        out_bmi.bmiHeader.biWidth       = rw;
+        out_bmi.bmiHeader.biHeight      = -rh;
+        out_bmi.bmiHeader.biPlanes      = 1;
+        out_bmi.bmiHeader.biBitCount    = 32;
+        out_bmi.bmiHeader.biCompression = BI_RGB;
+
+        uint8_t *out_bits = NULL;
+        HDC out_dc = CreateCompatibleDC(hdc);
+        HBITMAP out_bmp = CreateDIBSection(out_dc, &out_bmi, DIB_RGB_COLORS,
+                                            (void **)&out_bits, NULL, 0);
+        if (out_bmp && out_bits) {
+            HBITMAP old_bmp = (HBITMAP)SelectObject(out_dc, out_bmp);
+            BitBlt(out_dc, 0, 0, rw, rh, hdc, dest_x, dest_y, SRCCOPY);
+            GdiFlush();
+
+            int stride = rw * 4;
+            raster_blend(rctx, out_bits, stride, rw, rh, 0, 0, fr, fg, fb);
+
+            BitBlt(hdc, dest_x, dest_y, rw, rh, out_dc, 0, 0, SRCCOPY);
+
+            SelectObject(out_dc, old_bmp);
+            DeleteObject(out_bmp);
+        }
+        DeleteDC(out_dc);
+    }
+
+    raster_free(rctx);
+    return true;
+}
+
+/*
+ * Software AA stroke: expand the path outline by line_width and render as a fill.
+ * Converts each line segment to a filled rectangle, handling line joins.
+ * Returns true on success, false if fallback to GDI is needed.
+ */
+static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
+{
+    PdfGraphicsState *gs = current_gs(ctx);
+
+    /* Compute line width in device pixels */
+    double lw = gs->line_width;
+    PdfMatrix m = gs->ctm;
+    double scale_factor = sqrt(fabs(m.a * m.d - m.b * m.c));
+    double dev_width = lw * scale_factor;
+    if (dev_width < 0.5) dev_width = 0.5; /* minimum visible stroke */
+
+    double half_w = dev_width * 0.5;
+
+    /* Compute bounding box, expanded by half the stroke width + padding */
+    double bmin_x, bmin_y, bmax_x, bmax_y;
+    if (!path_bbox(pb, &bmin_x, &bmin_y, &bmax_x, &bmax_y))
+        return false;
+
+    bmin_x = floor(bmin_x - half_w) - 2.0;
+    bmin_y = floor(bmin_y - half_w) - 2.0;
+    bmax_x = ceil(bmax_x + half_w) + 2.0;
+    bmax_y = ceil(bmax_y + half_w) + 2.0;
+
+    int rw = (int)(bmax_x - bmin_x);
+    int rh = (int)(bmax_y - bmin_y);
+
+    if (rw <= 0 || rh <= 0) return false;
+    if (rw > 16384 || rh > 16384) return false;
+
+    RasterCtx *rctx = raster_create(rw, rh);
+    if (!rctx) return false;
+
+    /* Walk the path and expand each line/curve segment into a stroked outline.
+     * For each segment we create a filled rectangle (for lines) or
+     * use a simplified approach for curves (flatten + stroke each sub-segment).
+     *
+     * Strategy: we iterate through segments. For each line (x0,y0)->(x1,y1):
+     *   1. Compute the perpendicular offset vector (nx, ny) * half_w
+     *   2. Create a quad from the 4 corners
+     *   3. Feed the quad into the rasterizer as a closed subpath
+     *
+     * For Bezier curves: we tessellate them into short line segments first,
+     * then stroke each sub-segment. This reuses the rasterizer's bezier
+     * flattening by converting curves to a polyline first.
+     */
+
+    /* First, flatten the path into a list of line segments with subpath info */
+    #define MAX_FLAT_POINTS 32768
+    double *flat_x = (double *)malloc(MAX_FLAT_POINTS * sizeof(double));
+    double *flat_y = (double *)malloc(MAX_FLAT_POINTS * sizeof(double));
+    int *flat_cmd = (int *)malloc(MAX_FLAT_POINTS * sizeof(int)); /* 0=move, 1=line, 2=close */
+    if (!flat_x || !flat_y || !flat_cmd) {
+        free(flat_x); free(flat_y); free(flat_cmd);
+        raster_free(rctx);
+        return false;
+    }
+
+    int flat_count = 0;
+
+    /* Flatten curves into line segments */
+    for (int i = 0; i < pb->count; i++) {
+        if (flat_count >= MAX_FLAT_POINTS - 1) break;
+
+        BYTE t = pb->types[i] & ~PT_CLOSEFIGURE;
+        bool close = (pb->types[i] & PT_CLOSEFIGURE) != 0;
+
+        if (t == PT_MOVETO) {
+            flat_x[flat_count] = pb->dpts[i].x;
+            flat_y[flat_count] = pb->dpts[i].y;
+            flat_cmd[flat_count] = 0;
+            flat_count++;
+        } else if (t == PT_LINETO) {
+            flat_x[flat_count] = pb->dpts[i].x;
+            flat_y[flat_count] = pb->dpts[i].y;
+            flat_cmd[flat_count] = close ? 2 : 1;
+            flat_count++;
+        } else if (t == PT_BEZIERTO && i + 2 < pb->count) {
+            /* Flatten cubic bezier into line segments.
+             * Use De Casteljau subdivision until segments are short enough. */
+            double cx1 = pb->dpts[i].x,   cy1 = pb->dpts[i].y;
+            double cx2 = pb->dpts[i+1].x, cy2 = pb->dpts[i+1].y;
+            double ex  = pb->dpts[i+2].x, ey  = pb->dpts[i+2].y;
+
+            /* Find the start point (last point before this bezier) */
+            double sx = 0, sy = 0;
+            if (flat_count > 0) {
+                sx = flat_x[flat_count - 1];
+                sy = flat_y[flat_count - 1];
+            }
+
+            /* Simple recursive flattening with fixed step count.
+             * Subdivide into ~16 line segments. */
+            int n_steps = 16;
+            for (int step = 1; step <= n_steps && flat_count < MAX_FLAT_POINTS; step++) {
+                double t_param = (double)step / (double)n_steps;
+                double inv = 1.0 - t_param;
+                double inv2 = inv * inv;
+                double inv3 = inv2 * inv;
+                double t2 = t_param * t_param;
+                double t3 = t2 * t_param;
+
+                double bx = inv3 * sx + 3.0 * inv2 * t_param * cx1 +
+                            3.0 * inv * t2 * cx2 + t3 * ex;
+                double by = inv3 * sy + 3.0 * inv2 * t_param * cy1 +
+                            3.0 * inv * t2 * cy2 + t3 * ey;
+
+                flat_x[flat_count] = bx;
+                flat_y[flat_count] = by;
+                flat_cmd[flat_count] = (step == n_steps && close) ? 2 : 1;
+                flat_count++;
+            }
+            i += 2; /* skip the extra 2 bezier control points */
+        }
+    }
+
+    /* Now stroke each line segment as a filled quad */
+    double prev_x = 0, prev_y = 0;
+    double subpath_start_x = 0, subpath_start_y = 0;
+
+    for (int i = 0; i < flat_count; i++) {
+        if (flat_cmd[i] == 0) {
+            /* Move: update position, start new subpath */
+            prev_x = flat_x[i];
+            prev_y = flat_y[i];
+            subpath_start_x = prev_x;
+            subpath_start_y = prev_y;
+            continue;
+        }
+
+        /* Line or close segment */
+        double x0 = prev_x - bmin_x;
+        double y0 = prev_y - bmin_y;
+        double x1 = flat_x[i] - bmin_x;
+        double y1 = flat_y[i] - bmin_y;
+
+        /* Compute segment direction */
+        double dx = x1 - x0;
+        double dy = y1 - y0;
+        double len = sqrt(dx * dx + dy * dy);
+
+        if (len > 1e-10) {
+            /* Perpendicular offset: rotate direction 90 degrees */
+            double nx = (-dy / len) * half_w;
+            double ny = (dx / len) * half_w;
+
+            /* Create the quad for this segment */
+            raster_move_to(rctx, x0 + nx, y0 + ny);
+            raster_line_to(rctx, x1 + nx, y1 + ny);
+            raster_line_to(rctx, x1 - nx, y1 - ny);
+            raster_line_to(rctx, x0 - nx, y0 - ny);
+            raster_close(rctx);
+
+            /* Add round line join: draw a circle at each junction point.
+             * For miter joins we'd compute the miter, but circles at joints
+             * provide acceptable results for most PDF content.
+             * We approximate the circle with an octagon. */
+            if (gs->line_join == 1 || dev_width > 2.0) {
+                /* Add a filled circle at the start of each segment for joins */
+                int n_circle = 8;
+                for (int c = 0; c < n_circle; c++) {
+                    double angle = 2.0 * 3.14159265358979323846 * c / n_circle;
+                    double cx = x0 + cos(angle) * half_w;
+                    double cy = y0 + sin(angle) * half_w;
+                    if (c == 0) raster_move_to(rctx, cx, cy);
+                    else raster_line_to(rctx, cx, cy);
+                }
+                raster_close(rctx);
+            }
+
+            /* Line caps at the end of open subpaths */
+            if (gs->line_cap == 1) {
+                /* Round cap at start and end */
+                int n_circle = 8;
+                /* Only add end cap for the last segment in a subpath */
+                if (i + 1 >= flat_count || flat_cmd[i + 1] == 0 || flat_cmd[i] == 2) {
+                    for (int c = 0; c < n_circle; c++) {
+                        double angle = 2.0 * 3.14159265358979323846 * c / n_circle;
+                        double ccx = x1 + cos(angle) * half_w;
+                        double ccy = y1 + sin(angle) * half_w;
+                        if (c == 0) raster_move_to(rctx, ccx, ccy);
+                        else raster_line_to(rctx, ccx, ccy);
+                    }
+                    raster_close(rctx);
+                }
+            } else if (gs->line_cap == 2) {
+                /* Square cap: extend the line by half_w */
+                double ext_x = (dx / len) * half_w;
+                double ext_y = (dy / len) * half_w;
+                if (i + 1 >= flat_count || flat_cmd[i + 1] == 0 || flat_cmd[i] == 2) {
+                    raster_move_to(rctx, x1 + nx + ext_x, y1 + ny + ext_y);
+                    raster_line_to(rctx, x1 - nx + ext_x, y1 - ny + ext_y);
+                    raster_line_to(rctx, x1 - nx, y1 - ny);
+                    raster_line_to(rctx, x1 + nx, y1 + ny);
+                    raster_close(rctx);
+                }
+            }
+        }
+
+        prev_x = flat_x[i];
+        prev_y = flat_y[i];
+
+        /* If this was a close command, move back to subpath start */
+        if (flat_cmd[i] == 2) {
+            prev_x = subpath_start_x;
+            prev_y = subpath_start_y;
+        }
+    }
+
+    free(flat_x);
+    free(flat_y);
+    free(flat_cmd);
+
+    /* Compute coverage (strokes always use nonzero winding) */
+    raster_finish(rctx);
+
+    /* Blend onto page bitmap */
+    HDC hdc = ctx->hdc;
+    int page_w, page_h, page_stride;
+    uint8_t *page_bits = get_page_bits(hdc, &page_w, &page_h, &page_stride);
+
+    COLORREF stroke_col = pdf_color_to_gdi(gs->stroke_color);
+    int sr = GetRValue(stroke_col);
+    int sg = GetGValue(stroke_col);
+    int sb = GetBValue(stroke_col);
+
+    int dest_x = (int)bmin_x;
+    int dest_y = (int)bmin_y;
+
+    if (page_bits) {
+        GdiFlush();
+        raster_blend(rctx, page_bits, page_stride, page_w, page_h,
+                     dest_x, dest_y, sr, sg, sb);
+    } else {
+        BITMAPINFO out_bmi;
+        memset(&out_bmi, 0, sizeof(out_bmi));
+        out_bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        out_bmi.bmiHeader.biWidth       = rw;
+        out_bmi.bmiHeader.biHeight      = -rh;
+        out_bmi.bmiHeader.biPlanes      = 1;
+        out_bmi.bmiHeader.biBitCount    = 32;
+        out_bmi.bmiHeader.biCompression = BI_RGB;
+
+        uint8_t *out_bits = NULL;
+        HDC out_dc = CreateCompatibleDC(hdc);
+        HBITMAP out_bmp = CreateDIBSection(out_dc, &out_bmi, DIB_RGB_COLORS,
+                                            (void **)&out_bits, NULL, 0);
+        if (out_bmp && out_bits) {
+            HBITMAP old_bmp = (HBITMAP)SelectObject(out_dc, out_bmp);
+            BitBlt(out_dc, 0, 0, rw, rh, hdc, dest_x, dest_y, SRCCOPY);
+            GdiFlush();
+
+            int stride = rw * 4;
+            raster_blend(rctx, out_bits, stride, rw, rh, 0, 0, sr, sg, sb);
+
+            BitBlt(hdc, dest_x, dest_y, rw, rh, out_dc, 0, 0, SRCCOPY);
+
+            SelectObject(out_dc, old_bmp);
+            DeleteObject(out_bmp);
+        }
+        DeleteDC(out_dc);
+    }
+
+    raster_free(rctx);
+    return true;
+}
+
+/*
+ * Render the accumulated path with anti-aliased software rasterization.
+ * Falls back to GDI path rendering if the software path fails.
  * Operations: 1=stroke, 2=fill, 4=even-odd fill rule
  */
 static void path_paint(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
@@ -626,6 +1078,26 @@ static void path_paint(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
         return;
     }
 
+    /* Try software AA rendering first.
+     * For fill+stroke, we do fill first then stroke on top. */
+    bool fill_ok = true;
+    bool stroke_ok = true;
+
+    if (ops & 2) {
+        fill_ok = path_aa_fill(pb, ctx, ops);
+    }
+
+    if (ops & 1) {
+        stroke_ok = path_aa_stroke(pb, ctx);
+    }
+
+    /* If software rasterization succeeded, we're done */
+    if (fill_ok && stroke_ok) {
+        path_reset(pb);
+        return;
+    }
+
+    /* ── GDI Fallback ── */
     PdfGraphicsState *gs = current_gs(ctx);
     HDC hdc = ctx->hdc;
 
@@ -633,21 +1105,17 @@ static void path_paint(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
     HPEN pen = NULL;
     HPEN old_pen = NULL;
     if (ops & 1) {
-        /* Line width in device pixels */
         double lw = gs->line_width;
         PdfMatrix m = gs->ctm;
-        /* Approximate device line width from CTM */
         double scale_factor = sqrt(fabs(m.a * m.d - m.b * m.c));
         int pen_width = (int)(lw * scale_factor + 0.5);
         if (pen_width < 1) pen_width = 1;
 
         COLORREF stroke_col = pdf_color_to_gdi(gs->stroke_color);
         int pen_style = PS_SOLID;
-        /* Map line cap */
         int end_cap = PS_ENDCAP_FLAT;
         if (gs->line_cap == 1) end_cap = PS_ENDCAP_ROUND;
         else if (gs->line_cap == 2) end_cap = PS_ENDCAP_SQUARE;
-        /* Map line join */
         int join = PS_JOIN_MITER;
         if (gs->line_join == 1) join = PS_JOIN_ROUND;
         else if (gs->line_join == 2) join = PS_JOIN_BEVEL;
@@ -661,7 +1129,6 @@ static void path_paint(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
         if (pen) old_pen = (HPEN)SelectObject(hdc, pen);
     }
 
-    /* Create fill brush */
     HBRUSH brush = NULL;
     HBRUSH old_brush = NULL;
     if (ops & 2) {
@@ -669,23 +1136,19 @@ static void path_paint(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
         brush = CreateSolidBrush(fill_col);
         if (brush) old_brush = (HBRUSH)SelectObject(hdc, brush);
     } else {
-        /* No fill: use null brush */
         old_brush = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
     }
 
     if (!(ops & 1)) {
-        /* No stroke: use null pen */
         old_pen = (HPEN)SelectObject(hdc, GetStockObject(NULL_PEN));
     }
 
-    /* Set fill mode */
     if (ops & 4) {
-        SetPolyFillMode(hdc, ALTERNATE); /* even-odd */
+        SetPolyFillMode(hdc, ALTERNATE);
     } else {
-        SetPolyFillMode(hdc, WINDING);   /* nonzero winding */
+        SetPolyFillMode(hdc, WINDING);
     }
 
-    /* Replay path through GDI */
     BeginPath(hdc);
     for (int i = 0; i < pb->count; i++) {
         BYTE t = pb->types[i] & ~PT_CLOSEFIGURE;
@@ -696,11 +1159,10 @@ static void path_paint(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
         } else if (t == PT_LINETO) {
             LineTo(hdc, pb->pts[i].x, pb->pts[i].y);
         } else if (t == PT_BEZIERTO) {
-            /* Need exactly 3 bezier control points */
             if (i + 2 < pb->count) {
                 POINT bpts[3] = { pb->pts[i], pb->pts[i+1], pb->pts[i+2] };
                 PolyBezierTo(hdc, bpts, 3);
-                i += 2; /* skip the next two, loop will do i++ */
+                i += 2;
             }
         }
 
@@ -710,9 +1172,7 @@ static void path_paint(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
     }
     EndPath(hdc);
 
-    /* Paint */
     if ((ops & 3) == 3) {
-        /* Fill and stroke */
         StrokeAndFillPath(hdc);
     } else if (ops & 2) {
         FillPath(hdc);
@@ -720,7 +1180,6 @@ static void path_paint(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
         StrokePath(hdc);
     }
 
-    /* Cleanup */
     if (old_pen)  SelectObject(hdc, old_pen);
     if (old_brush && (ops & 2)) SelectObject(hdc, old_brush);
     else if (!(ops & 2) && old_brush) SelectObject(hdc, old_brush);
@@ -1434,11 +1893,13 @@ static bool image_has_jpeg_filter(PdfDict *dict)
  * Blit a completed HBITMAP image to the render context DC at the CTM position.
  * Used by both raw-pixel and WIC-decoded image paths.
  */
-static void blit_image_to_dc(PdfRenderCtx *ctx, HBITMAP hbm, int width, int height)
+/*
+ * Compute the destination rectangle in device pixels from the current CTM.
+ * Images in PDF are defined in a 1x1 unit square; the CTM scales and positions them.
+ */
+static void compute_image_dest_rect(PdfRenderCtx *ctx,
+                                      int *out_x, int *out_y, int *out_w, int *out_h)
 {
-    /* Compute destination rectangle from CTM.
-     * Images in PDF are defined in a 1x1 unit square at the origin,
-     * and the CTM maps them to the target position and size. */
     PdfMatrix m = current_gs(ctx)->ctm;
     double x0, y0, x1, y1, x2, y2, x3, y3;
     pdf_transform_point(m, 0.0, 0.0, &x0, &y0);
@@ -1446,7 +1907,6 @@ static void blit_image_to_dc(PdfRenderCtx *ctx, HBITMAP hbm, int width, int heig
     pdf_transform_point(m, 1.0, 1.0, &x2, &y2);
     pdf_transform_point(m, 0.0, 1.0, &x3, &y3);
 
-    /* Find bounding box */
     double min_x = x0, max_x = x0, min_y = y0, max_y = y0;
     if (x1 < min_x) min_x = x1; if (x1 > max_x) max_x = x1;
     if (x2 < min_x) min_x = x2; if (x2 > max_x) max_x = x2;
@@ -1455,20 +1915,53 @@ static void blit_image_to_dc(PdfRenderCtx *ctx, HBITMAP hbm, int width, int heig
     if (y2 < min_y) min_y = y2; if (y2 > max_y) max_y = y2;
     if (y3 < min_y) min_y = y3; if (y3 > max_y) max_y = y3;
 
-    int dest_x = (int)(min_x + 0.5);
-    int dest_y = (int)(min_y + 0.5);
-    int dest_w = (int)(max_x - min_x + 0.5);
-    int dest_h = (int)(max_y - min_y + 0.5);
-    if (dest_w < 1) dest_w = 1;
-    if (dest_h < 1) dest_h = 1;
+    *out_x = (int)(min_x + 0.5);
+    *out_y = (int)(min_y + 0.5);
+    *out_w = (int)(max_x - min_x + 0.5);
+    *out_h = (int)(max_y - min_y + 0.5);
+    if (*out_w < 1) *out_w = 1;
+    if (*out_h < 1) *out_h = 1;
+}
 
-    /* StretchBlt the image to the DC */
+static void blit_image_to_dc(PdfRenderCtx *ctx, HBITMAP hbm, int width, int height)
+{
+    int dest_x, dest_y, dest_w, dest_h;
+    compute_image_dest_rect(ctx, &dest_x, &dest_y, &dest_w, &dest_h);
+
     HDC mem_dc = CreateCompatibleDC(ctx->hdc);
     HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
     SetStretchBltMode(ctx->hdc, HALFTONE);
     SetBrushOrgEx(ctx->hdc, 0, 0, NULL);
     StretchBlt(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
                mem_dc, 0, 0, width, height, SRCCOPY);
+    SelectObject(mem_dc, old_bm);
+    DeleteDC(mem_dc);
+}
+
+/*
+ * Blit an image with per-pixel alpha (premultiplied) using AlphaBlend.
+ * Used for images with SMask (soft mask / transparency).
+ * The hbm must have premultiplied alpha in its BGRA data.
+ */
+static void blit_image_to_dc_alpha(PdfRenderCtx *ctx, HBITMAP hbm,
+                                     int width, int height)
+{
+    int dest_x, dest_y, dest_w, dest_h;
+    compute_image_dest_rect(ctx, &dest_x, &dest_y, &dest_w, &dest_h);
+
+    HDC mem_dc = CreateCompatibleDC(ctx->hdc);
+    HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
+    SetStretchBltMode(ctx->hdc, HALFTONE);
+
+    BLENDFUNCTION bf;
+    bf.BlendOp = AC_SRC_OVER;
+    bf.BlendFlags = 0;
+    bf.SourceConstantAlpha = 255;    /* use per-pixel alpha */
+    bf.AlphaFormat = AC_SRC_ALPHA;   /* source has premultiplied alpha */
+
+    AlphaBlend(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
+               mem_dc, 0, 0, width, height, bf);
+
     SelectObject(mem_dc, old_bm);
     DeleteDC(mem_dc);
 }
@@ -1680,7 +2173,49 @@ wic_cleanup:
  *  - Indexed color spaces: [/Indexed base hival lookup]
  *  - ICCBased color spaces (by component count)
  *  - DCTDecode (JPEG) images via WIC
+ *  - SMask (soft mask / transparency) via AlphaBlend
  */
+
+/*
+ * Decode an SMask (soft mask) stream into an alpha buffer.
+ * Returns a malloc'd array of width*height bytes, or NULL on failure.
+ * The SMask is a grayscale image defining per-pixel opacity (0=transparent, 255=opaque).
+ */
+static uint8_t *decode_smask(PdfRenderCtx *ctx, PdfDict *image_dict,
+                               int img_width, int img_height)
+{
+    PdfObj *smask_obj = pdf_dict_get(image_dict, "SMask");
+    if (!smask_obj) return NULL;
+    smask_obj = pdf_resolve(ctx->doc, smask_obj);
+    if (!smask_obj || smask_obj->type != PDF_OBJ_STREAM) return NULL;
+
+    PdfStream *smask_stream = smask_obj->stream;
+    if (!smask_stream || !smask_stream->dict) return NULL;
+
+    int sw = pdf_dict_get_int(smask_stream->dict, "Width", 0);
+    int sh = pdf_dict_get_int(smask_stream->dict, "Height", 0);
+    int sbpc = pdf_dict_get_int(smask_stream->dict, "BitsPerComponent", 8);
+
+    /* SMask must match image dimensions and be 8-bit grayscale */
+    if (sw != img_width || sh != img_height || sbpc != 8) return NULL;
+
+    /* Decode the SMask stream */
+    if (!smask_stream->decoded_data) {
+        if (!pdf_decode_stream(ctx->doc, smask_stream))
+            return NULL;
+    }
+    if (!smask_stream->decoded_data) return NULL;
+
+    size_t expected = (size_t)sw * sh;
+    if (smask_stream->decoded_length < expected) return NULL;
+
+    /* Copy the alpha data */
+    uint8_t *alpha = (uint8_t *)malloc(expected);
+    if (!alpha) return NULL;
+    memcpy(alpha, smask_stream->decoded_data, expected);
+    return alpha;
+}
+
 static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
 {
     if (!xobj || xobj->type != PDF_OBJ_STREAM) return;
@@ -1697,9 +2232,6 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
     /* Check if the image is JPEG-encoded (DCTDecode).
      * For JPEG images, we use the raw stream data and WIC to decode. */
     if (image_has_jpeg_filter(dict)) {
-        /* For DCTDecode, we need the raw stream data (still JPEG-compressed).
-         * The pdf_decode_stream would have passed it through unchanged via
-         * the "unsupported filter" path. Use raw_data if available. */
         const uint8_t *jpeg_data = stream->raw_data;
         size_t jpeg_len = stream->raw_length;
         if (!jpeg_data || jpeg_len == 0) return;
@@ -1738,6 +2270,10 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
     size_t expected = (size_t)width * height * components;
     if (src_len < expected) return;
 
+    /* Check for SMask (soft mask / transparency) */
+    uint8_t *smask_alpha = decode_smask(ctx, dict, width, height);
+    bool has_alpha = (smask_alpha != NULL);
+
     /* Create a DIB section for the image */
     BITMAPINFO bmi;
     memset(&bmi, 0, sizeof(bmi));
@@ -1753,6 +2289,7 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
                                     (void **)&dib_bits, NULL, 0);
     if (!hbm || !dib_bits) {
         if (hbm) DeleteObject(hbm);
+        free(smask_alpha);
         return;
     }
 
@@ -1764,7 +2301,6 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
             uint8_t r, g, b;
 
             if (is_indexed) {
-                /* Index into palette */
                 uint8_t idx = src[src_idx];
                 if (idx < palette_count) {
                     r = palette_rgb[idx * 3 + 0];
@@ -1792,15 +2328,30 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
                 r = g = b = 128;
             }
 
-            dib_bits[dst_idx + 0] = b;  /* Blue */
-            dib_bits[dst_idx + 1] = g;  /* Green */
-            dib_bits[dst_idx + 2] = r;  /* Red */
-            dib_bits[dst_idx + 3] = 255; /* Alpha */
+            if (has_alpha) {
+                /* Apply SMask alpha and premultiply for AlphaBlend.
+                 * AlphaBlend requires premultiplied alpha: color = color * alpha / 255 */
+                uint8_t a = smask_alpha[(size_t)py * width + px];
+                dib_bits[dst_idx + 0] = (uint8_t)((b * a + 127) / 255); /* Blue * alpha */
+                dib_bits[dst_idx + 1] = (uint8_t)((g * a + 127) / 255); /* Green * alpha */
+                dib_bits[dst_idx + 2] = (uint8_t)((r * a + 127) / 255); /* Red * alpha */
+                dib_bits[dst_idx + 3] = a;
+            } else {
+                dib_bits[dst_idx + 0] = b;
+                dib_bits[dst_idx + 1] = g;
+                dib_bits[dst_idx + 2] = r;
+                dib_bits[dst_idx + 3] = 255;
+            }
         }
     }
 
-    blit_image_to_dc(ctx, hbm, width, height);
+    if (has_alpha) {
+        blit_image_to_dc_alpha(ctx, hbm, width, height);
+    } else {
+        blit_image_to_dc(ctx, hbm, width, height);
+    }
     DeleteObject(hbm);
+    free(smask_alpha);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
