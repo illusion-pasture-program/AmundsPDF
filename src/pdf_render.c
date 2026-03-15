@@ -1101,11 +1101,11 @@ static bool path_aa_fill(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
     if (!path_bbox(pb, &bmin_x, &bmin_y, &bmax_x, &bmax_y))
         return false;
 
-    /* Add 2px padding for anti-aliasing edges */
-    bmin_x = floor(bmin_x) - 2.0;
-    bmin_y = floor(bmin_y) - 2.0;
-    bmax_x = ceil(bmax_x) + 2.0;
-    bmax_y = ceil(bmax_y) + 2.0;
+    /* Add 3px padding for anti-aliasing edges + 1px dilation bleed */
+    bmin_x = floor(bmin_x) - 3.0;
+    bmin_y = floor(bmin_y) - 3.0;
+    bmax_x = ceil(bmax_x) + 3.0;
+    bmax_y = ceil(bmax_y) + 3.0;
 
     int rw = (int)(bmax_x - bmin_x);
     int rh = (int)(bmax_y - bmin_y);
@@ -1464,144 +1464,183 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
         flat_count = dash_out;
     }
 
-    /* Now stroke each line segment as a filled quad */
+    /* Build stroke outline as a SINGLE continuous polygon per subpath.
+     * Instead of rendering each segment as a separate quad (which creates
+     * visible seam cracks at junction points due to AA), trace the left
+     * edge forward and right edge backward as one closed polygon.
+     *
+     * For each subpath: collect all segment endpoints with their
+     * perpendicular offsets, then emit:
+     *   start_cap + left_edge[0..n] + end_cap + right_edge[n..0] + close
+     */
     double prev_x = 0, prev_y = 0;
     double subpath_start_x = 0, subpath_start_y = 0;
-    bool first_in_subpath = true;  /* true until we've drawn the first segment after a moveto */
 
-    for (int i = 0; i < flat_count; i++) {
-        if (flat_cmd[i] == 0) {
-            /* Move: update position, start new subpath */
+    /* Temporary arrays for left and right edge points */
+    double *left_x  = (double *)malloc(flat_count * sizeof(double));
+    double *left_y  = (double *)malloc(flat_count * sizeof(double));
+    double *right_x = (double *)malloc(flat_count * sizeof(double));
+    double *right_y = (double *)malloc(flat_count * sizeof(double));
+    if (!left_x || !left_y || !right_x || !right_y) {
+        free(left_x); free(left_y); free(right_x); free(right_y);
+        free(flat_x); free(flat_y); free(flat_cmd);
+        raster_free(rctx);
+        return false;
+    }
+
+    int edge_count = 0;
+    int subpath_edge_start = 0;
+    bool in_subpath = false;
+    /* Direction of first and last segments (for caps) */
+    double first_dir_x = 0, first_dir_y = 0;
+    double last_dir_x = 0, last_dir_y = 0;
+
+    for (int i = 0; i <= flat_count; i++) {
+        bool is_end = (i >= flat_count);
+        bool is_move = (!is_end && flat_cmd[i] == 0);
+        bool flush = (is_end || is_move) && in_subpath && edge_count > subpath_edge_start;
+
+        if (flush) {
+            /* Emit the stroke outline for this subpath as a single polygon */
+            int n = edge_count - subpath_edge_start;
+            int s = subpath_edge_start;
+            bool is_closed = (!is_end && !is_move) ? (flat_cmd[i] == 2) : false;
+            /* Check if last point before flush was a close */
+            if (i > 0 && i <= flat_count && flat_cmd[i-1] == 2) is_closed = true;
+            bool is_open = !is_closed;
+
+            /* Start the polygon: begin at left edge of first point */
+            if (is_open && gs->line_cap == 1 && n >= 1) {
+                /* Round start cap: semicircle from right→backward→left */
+                int n_half = (int)(half_w * 3.0);
+                if (n_half < 6) n_half = 6;
+                if (n_half > 32) n_half = 32;
+                raster_move_to(rctx, right_x[s], right_y[s]);
+                for (int c = 1; c <= n_half; c++) {
+                    double t = 3.14159265358979323846 * c / n_half;
+                    double px = left_x[s] - right_x[s];
+                    double py = left_y[s] - right_y[s];
+                    double mx = (left_x[s] + right_x[s]) * 0.5;
+                    double my = (left_y[s] + right_y[s]) * 0.5;
+                    /* Semicircle center is at the path point (midpoint of left/right) */
+                    double cos_t = cos(t);
+                    double sin_t = sin(t);
+                    /* Rotate from right edge through backward to left edge */
+                    double rx = (right_x[s] - mx);
+                    double ry = (right_y[s] - my);
+                    double bx = -first_dir_x * half_w;
+                    double by = -first_dir_y * half_w;
+                    /* Parametric: interpolate angle from right-edge to left-edge via backward */
+                    double ax = rx * cos_t + bx * sin_t;
+                    double ay = ry * cos_t + by * sin_t;
+                    raster_line_to(rctx, mx + ax, my + ay);
+                }
+                raster_line_to(rctx, left_x[s], left_y[s]);
+            } else if (is_open && gs->line_cap == 2 && n >= 1) {
+                /* Square start cap */
+                raster_move_to(rctx, right_x[s] - first_dir_x * half_w,
+                               right_y[s] - first_dir_y * half_w);
+                raster_line_to(rctx, left_x[s] - first_dir_x * half_w,
+                               left_y[s] - first_dir_y * half_w);
+                raster_line_to(rctx, left_x[s], left_y[s]);
+            } else {
+                raster_move_to(rctx, left_x[s], left_y[s]);
+            }
+
+            /* Trace left edge forward */
+            for (int j = s + 1; j < s + n; j++) {
+                raster_line_to(rctx, left_x[j], left_y[j]);
+            }
+
+            /* End cap or corner */
+            int last = s + n - 1;
+            if (is_open && gs->line_cap == 1 && n >= 1) {
+                /* Round end cap: semicircle from left→forward→right */
+                int n_half = (int)(half_w * 3.0);
+                if (n_half < 6) n_half = 6;
+                if (n_half > 32) n_half = 32;
+                for (int c = 1; c <= n_half; c++) {
+                    double t = 3.14159265358979323846 * c / n_half;
+                    double mx = (left_x[last] + right_x[last]) * 0.5;
+                    double my = (left_y[last] + right_y[last]) * 0.5;
+                    double lx = (left_x[last] - mx);
+                    double ly = (left_y[last] - my);
+                    double fx = last_dir_x * half_w;
+                    double fy = last_dir_y * half_w;
+                    double ax = lx * cos(t) + fx * sin(t);
+                    double ay = ly * cos(t) + fy * sin(t);
+                    raster_line_to(rctx, mx + ax, my + ay);
+                }
+            } else if (is_open && gs->line_cap == 2 && n >= 1) {
+                /* Square end cap */
+                raster_line_to(rctx, left_x[last] + last_dir_x * half_w,
+                               left_y[last] + last_dir_y * half_w);
+                raster_line_to(rctx, right_x[last] + last_dir_x * half_w,
+                               right_y[last] + last_dir_y * half_w);
+            }
+
+            /* Trace right edge backward */
+            for (int j = s + n - 1; j >= s; j--) {
+                raster_line_to(rctx, right_x[j], right_y[j]);
+            }
+
+            raster_close(rctx);
+
+            edge_count = subpath_edge_start;
+        }
+
+        if (is_end) break;
+
+        if (is_move) {
             prev_x = flat_x[i];
             prev_y = flat_y[i];
             subpath_start_x = prev_x;
             subpath_start_y = prev_y;
-            first_in_subpath = true;
+            subpath_edge_start = edge_count;
+            in_subpath = true;
             continue;
         }
 
-        /* Line or close segment */
+        /* Line or close segment: compute perpendicular offsets */
         double x0 = prev_x - bmin_x;
         double y0 = prev_y - bmin_y;
         double x1 = flat_x[i] - bmin_x;
         double y1 = flat_y[i] - bmin_y;
 
-        /* Compute segment direction */
         double dx = x1 - x0;
         double dy = y1 - y0;
-        double len = sqrt(dx * dx + dy * dy);
+        double seg_len = sqrt(dx * dx + dy * dy);
 
-        /* Is this the last segment in the subpath? */
-        bool is_last = (i + 1 >= flat_count || flat_cmd[i + 1] == 0 || flat_cmd[i] == 2);
-        /* Is this an open subpath end? (not a close command) */
-        bool is_open_end = is_last && flat_cmd[i] != 2;
+        if (seg_len > 1e-10) {
+            double nx = (-dy / seg_len) * half_w;
+            double ny = (dx / seg_len) * half_w;
 
-        if (len > 1e-10) {
-            /* Perpendicular offset: rotate direction 90 degrees */
-            double nx = (-dy / len) * half_w;
-            double ny = (dx / len) * half_w;
-
-            /* Create the quad for this segment */
-            raster_move_to(rctx, x0 + nx, y0 + ny);
-            raster_line_to(rctx, x1 + nx, y1 + ny);
-            raster_line_to(rctx, x1 - nx, y1 - ny);
-            raster_line_to(rctx, x0 - nx, y0 - ny);
-            raster_close(rctx);
-
-            /* Line join handling at junction points.
-             * Joins only apply at points where two segments CONNECT —
-             * NOT at the start of a subpath (moveto point).
-             * Round joins draw a semicircular arc on the OUTSIDE of the bend
-             * to smoothly connect the outer edges of adjacent quads. */
-            if (!first_in_subpath && gs->line_join == 1) {
-                /* Round join: draw a semicircular arc at the junction.
-                 * Use a full circle here since the rasterizer's nonzero winding
-                 * rule correctly handles the overlap with adjacent quads. */
-                int n_arc = (int)(half_w * 3.0);
-                if (n_arc < 8) n_arc = 8;
-                if (n_arc > 48) n_arc = 48;
-                for (int c = 0; c < n_arc; c++) {
-                    double angle = 2.0 * 3.14159265358979323846 * c / n_arc;
-                    double cx = x0 + cos(angle) * half_w;
-                    double cy = y0 + sin(angle) * half_w;
-                    if (c == 0) raster_move_to(rctx, cx, cy);
-                    else raster_line_to(rctx, cx, cy);
-                }
-                raster_close(rctx);
+            if (edge_count == subpath_edge_start) {
+                /* First segment: store both start and end points */
+                left_x[edge_count]  = x0 + nx; left_y[edge_count]  = y0 + ny;
+                right_x[edge_count] = x0 - nx; right_y[edge_count] = y0 - ny;
+                first_dir_x = dx / seg_len;
+                first_dir_y = dy / seg_len;
+                edge_count++;
             }
-
-            /* Line caps: round/square caps at the START and END of open subpaths.
-             * Round caps are rendered as SEMICIRCLES extending beyond the endpoint,
-             * NOT as full circles. This avoids overlap artifacts with the quad.
-             * The semicircle connects the two perpendicular edges of the quad and
-             * passes through the point half_w beyond the endpoint. */
-            if (gs->line_cap == 1) {
-                int n_half = (int)(half_w * 3.0);
-                if (n_half < 6) n_half = 6;
-                if (n_half > 32) n_half = 32;
-                double dir_x = dx / len;  /* unit direction vector along segment */
-                double dir_y = dy / len;
-
-                /* Start cap: semicircle extending BACKWARD from start point */
-                if (first_in_subpath) {
-                    /* Start from one perpendicular edge, arc backward, end at other edge */
-                    raster_move_to(rctx, x0 + nx, y0 + ny);
-                    for (int c = 1; c <= n_half; c++) {
-                        /* Arc from perpendicular+ through backward to perpendicular- */
-                        double t = 3.14159265358979323846 * c / n_half;
-                        /* Rotate: start at perp direction, sweep π radians backward */
-                        double ax = nx * cos(t) + (-dir_x * half_w) * sin(t);
-                        double ay = ny * cos(t) + (-dir_y * half_w) * sin(t);
-                        raster_line_to(rctx, x0 + ax, y0 + ay);
-                    }
-                    /* Close back through the quad edge (straight line across) */
-                    raster_line_to(rctx, x0 + nx, y0 + ny);
-                    raster_close(rctx);
-                }
-                /* End cap: semicircle extending FORWARD from end point */
-                if (is_open_end) {
-                    raster_move_to(rctx, x1 + nx, y1 + ny);
-                    for (int c = 1; c <= n_half; c++) {
-                        double t = 3.14159265358979323846 * c / n_half;
-                        double ax = nx * cos(t) + (dir_x * half_w) * sin(t);
-                        double ay = ny * cos(t) + (dir_y * half_w) * sin(t);
-                        raster_line_to(rctx, x1 + ax, y1 + ay);
-                    }
-                    raster_line_to(rctx, x1 + nx, y1 + ny);
-                    raster_close(rctx);
-                }
-            } else if (gs->line_cap == 2) {
-                double ext_x = (dx / len) * half_w;
-                double ext_y = (dy / len) * half_w;
-                /* Start square cap */
-                if (first_in_subpath) {
-                    raster_move_to(rctx, x0 + nx - ext_x, y0 + ny - ext_y);
-                    raster_line_to(rctx, x0 - nx - ext_x, y0 - ny - ext_y);
-                    raster_line_to(rctx, x0 - nx, y0 - ny);
-                    raster_line_to(rctx, x0 + nx, y0 + ny);
-                    raster_close(rctx);
-                }
-                /* End square cap */
-                if (is_open_end) {
-                    raster_move_to(rctx, x1 + nx + ext_x, y1 + ny + ext_y);
-                    raster_line_to(rctx, x1 - nx + ext_x, y1 - ny + ext_y);
-                    raster_line_to(rctx, x1 - nx, y1 - ny);
-                    raster_line_to(rctx, x1 + nx, y1 + ny);
-                    raster_close(rctx);
-                }
-            }
+            /* Store end point of this segment */
+            left_x[edge_count]  = x1 + nx; left_y[edge_count]  = y1 + ny;
+            right_x[edge_count] = x1 - nx; right_y[edge_count] = y1 - ny;
+            last_dir_x = dx / seg_len;
+            last_dir_y = dy / seg_len;
+            edge_count++;
         }
 
-        first_in_subpath = false;
         prev_x = flat_x[i];
         prev_y = flat_y[i];
-
-        /* If this was a close command, move back to subpath start */
         if (flat_cmd[i] == 2) {
             prev_x = subpath_start_x;
             prev_y = subpath_start_y;
         }
     }
+
+    free(left_x); free(left_y);
+    free(right_x); free(right_y);
 
     free(flat_x);
     free(flat_y);
