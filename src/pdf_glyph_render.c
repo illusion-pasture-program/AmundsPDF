@@ -15,6 +15,7 @@
 #include "pdf_glyph.h"
 #include "pdf_parser.h"
 #include "pdf_raster.h"
+#include "pdf_profile.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Font Cache
@@ -329,14 +330,16 @@ static void render_glyph_outline(HDC hdc, GlyphOutline *outline, ParsedFont *fon
                                   double font_size, PdfMatrix combined, COLORREF color,
                                   const uint8_t *clip_mask, int clip_mask_w, int clip_mask_h)
 {
-    if (!outline || outline->count == 0) return;
-    if (font->units_per_em <= 0) return;
+    PROF_START(glyph);
+
+    if (!outline || outline->count == 0) { PROF_END(glyph, glyph); return; }
+    if (font->units_per_em <= 0) { PROF_END(glyph, glyph); return; }
 
     /* Compute device-space bounding box */
     double bmin_x, bmin_y, bmax_x, bmax_y;
     if (!glyph_device_bounds(outline, font_size, font->units_per_em, combined,
                               &bmin_x, &bmin_y, &bmax_x, &bmax_y))
-        return;
+        { PROF_END(glyph, glyph); return; }
 
     /* Add 2px padding for anti-aliasing edges */
     bmin_x = floor(bmin_x) - 2.0;
@@ -348,12 +351,12 @@ static void render_glyph_outline(HDC hdc, GlyphOutline *outline, ParsedFont *fon
     int glyph_h = (int)(bmax_y - bmin_y);
 
     /* Sanity check: skip glyphs that are too large or degenerate */
-    if (glyph_w <= 0 || glyph_h <= 0) return;
-    if (glyph_w > 2000 || glyph_h > 2000) return;
+    if (glyph_w <= 0 || glyph_h <= 0) { PROF_END(glyph, glyph); return; }
+    if (glyph_w > 2000 || glyph_h > 2000) { PROF_END(glyph, glyph); return; }
 
     /* Create rasterizer context for the glyph bbox */
     RasterCtx *rctx = raster_create(glyph_w, glyph_h);
-    if (!rctx) return;
+    if (!rctx) { PROF_END(glyph, glyph); return; }
 
     /* Feed the glyph outline to the rasterizer.
      * Transform coordinates from font units to device pixels,
@@ -406,7 +409,7 @@ static void render_glyph_outline(HDC hdc, GlyphOutline *outline, ParsedFont *fon
     HBITMAP hbm = (HBITMAP)GetCurrentObject(hdc, OBJ_BITMAP);
     if (!hbm) {
         raster_free(rctx);
-        return;
+        PROF_END(glyph, glyph); return;
     }
 
     DIBSECTION ds;
@@ -445,7 +448,7 @@ static void render_glyph_outline(HDC hdc, GlyphOutline *outline, ParsedFont *fon
         }
         DeleteDC(out_dc);
         raster_free(rctx);
-        return;
+        PROF_END(glyph, glyph); return;
     }
 
     /* Direct pixel access to the page bitmap.
@@ -468,6 +471,7 @@ static void render_glyph_outline(HDC hdc, GlyphOutline *outline, ParsedFont *fon
                          clip_mask, clip_mask_w, clip_mask_h, dest_x, dest_y);
 
     raster_free(rctx);
+    PROF_END(glyph, glyph);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

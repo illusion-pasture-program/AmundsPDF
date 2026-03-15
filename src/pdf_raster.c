@@ -24,6 +24,7 @@
  */
 
 #include "pdf_raster.h"
+#include "pdf_profile.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -35,7 +36,7 @@
 /* Number of vertical sub-scanlines per pixel row for anti-aliasing.
  * 16 gives high quality for text and path rendering (16 levels of vertical AA).
  * Higher values give smoother edges at the cost of more scanline processing. */
-#define SUBSAMPLE_Y     16
+#define SUBSAMPLE_Y     8
 
 /* Flatness threshold for bezier subdivision (in pixels squared).
  * Smaller = more accurate curves but more edges. 0.1 px gives sub-pixel
@@ -514,8 +515,9 @@ static void sort_crossings(double *xs, int *dirs, int n)
  * fill_rule: FILL_RULE_NONZERO or FILL_RULE_EVENODD */
 static void raster_finish_internal(RasterCtx *ctx, int fill_rule)
 {
-    if (!ctx) return;
-    if (ctx->edge_count == 0) return;
+    PROF_START(rfin);
+    if (!ctx) { PROF_END(raster_finish, rfin); return; }
+    if (ctx->edge_count == 0) { PROF_END(raster_finish, rfin); return; }
 
     int width  = ctx->width;
     int height = ctx->height;
@@ -647,6 +649,7 @@ static void raster_finish_internal(RasterCtx *ctx, int fill_rule)
     }
 
     free(row_counts);
+    PROF_END(raster_finish, rfin);
 }
 
 void raster_finish(RasterCtx *ctx)
@@ -696,7 +699,8 @@ static void raster_blend_internal(RasterCtx *ctx,
                                     const uint8_t *clip_mask, int clip_w, int clip_h,
                                     int clip_off_x, int clip_off_y)
 {
-    if (!ctx || !target) return;
+    PROF_START(bld);
+    if (!ctx || !target) { PROF_END(blend, bld); return; }
 
     const uint8_t *coverage = ctx->coverage;
     int cw = ctx->width;
@@ -753,6 +757,7 @@ static void raster_blend_internal(RasterCtx *ctx,
             }
         }
     }
+    PROF_END(blend, bld);
 }
 
 void raster_blend(RasterCtx *ctx,

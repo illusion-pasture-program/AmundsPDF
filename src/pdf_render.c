@@ -12,7 +12,11 @@
 #include "pdf_fonts.h"
 #include "pdf_glyph_render.h"
 #include "pdf_raster.h"
+#include "pdf_profile.h"
 #include <objbase.h>  /* CoInitializeEx, CoCreateInstance for WIC image decoding */
+
+/* Global profiling accumulator (declared extern in pdf_profile.h) */
+RenderProfile g_prof;
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Content Stream Tokenizer
@@ -1096,10 +1100,12 @@ static uint8_t *get_page_bits(HDC hdc, int *page_w, int *page_h, int *page_strid
  */
 static bool path_aa_fill(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
 {
+    PROF_START(fill);
+
     /* Compute bounding box of the path in device pixels */
     double bmin_x, bmin_y, bmax_x, bmax_y;
     if (!path_bbox(pb, &bmin_x, &bmin_y, &bmax_x, &bmax_y))
-        return false;
+        { PROF_END(fill, fill); return false; }
 
     /* Add 3px padding for anti-aliasing edges + 1px dilation bleed */
     bmin_x = floor(bmin_x) - 3.0;
@@ -1111,11 +1117,11 @@ static bool path_aa_fill(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
     int rh = (int)(bmax_y - bmin_y);
 
     /* Sanity check: rasterizer has size limits */
-    if (rw <= 0 || rh <= 0) return false;
-    if (rw > 16384 || rh > 16384) return false;
+    if (rw <= 0 || rh <= 0) { PROF_END(fill, fill); return false; }
+    if (rw > 16384 || rh > 16384) { PROF_END(fill, fill); return false; }
 
     RasterCtx *rctx = raster_create(rw, rh);
-    if (!rctx) return false;
+    if (!rctx) { PROF_END(fill, fill); return false; }
 
     /* Replay path through rasterizer using double coordinates */
     for (int i = 0; i < pb->count; i++) {
@@ -1212,6 +1218,7 @@ static bool path_aa_fill(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
     }
 
     raster_free(rctx);
+    PROF_END(fill, fill);
     return true;
 }
 
@@ -1222,6 +1229,8 @@ static bool path_aa_fill(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
  */
 static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
 {
+    PROF_START(stroke);
+
     PdfGraphicsState *gs = current_gs(ctx);
 
     /* Compute line width in device pixels */
@@ -1236,7 +1245,7 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
     /* Compute bounding box, expanded by half the stroke width + padding */
     double bmin_x, bmin_y, bmax_x, bmax_y;
     if (!path_bbox(pb, &bmin_x, &bmin_y, &bmax_x, &bmax_y))
-        return false;
+        { PROF_END(stroke, stroke); return false; }
 
     bmin_x = floor(bmin_x - half_w) - 2.0;
     bmin_y = floor(bmin_y - half_w) - 2.0;
@@ -1246,11 +1255,11 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
     int rw = (int)(bmax_x - bmin_x);
     int rh = (int)(bmax_y - bmin_y);
 
-    if (rw <= 0 || rh <= 0) return false;
-    if (rw > 16384 || rh > 16384) return false;
+    if (rw <= 0 || rh <= 0) { PROF_END(stroke, stroke); return false; }
+    if (rw > 16384 || rh > 16384) { PROF_END(stroke, stroke); return false; }
 
     RasterCtx *rctx = raster_create(rw, rh);
-    if (!rctx) return false;
+    if (!rctx) { PROF_END(stroke, stroke); return false; }
 
     /* Walk the path and expand each line/curve segment into a stroked outline.
      * For each segment we create a filled rectangle (for lines) or
@@ -1274,7 +1283,7 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
     if (!flat_x || !flat_y || !flat_cmd) {
         free(flat_x); free(flat_y); free(flat_cmd);
         raster_free(rctx);
-        return false;
+        PROF_END(stroke, stroke); return false;
     }
 
     int flat_count = 0;
@@ -1363,7 +1372,7 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
             free(dash_x); free(dash_y); free(dash_cmd);
             free(flat_x); free(flat_y); free(flat_cmd);
             raster_free(rctx);
-            return false;
+            PROF_END(stroke, stroke); return false;
         }
         int dash_out = 0;
         int max_dash_pts = MAX_FLAT_POINTS * 2;
@@ -1485,7 +1494,7 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
         free(left_x); free(left_y); free(right_x); free(right_y);
         free(flat_x); free(flat_y); free(flat_cmd);
         raster_free(rctx);
-        return false;
+        PROF_END(stroke, stroke); return false;
     }
 
     int edge_count = 0;
@@ -1704,6 +1713,7 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
     }
 
     raster_free(rctx);
+    PROF_END(stroke, stroke);
     return true;
 }
 
@@ -3672,7 +3682,9 @@ static void do_xobject(PdfRenderCtx *ctx, PdfDict *resources, const char *name)
         if (!subtype) return;
 
         if (strcmp(subtype, "Image") == 0) {
+            PROF_START(img);
             render_image(ctx, xobj);
+            PROF_END(image, img);
         } else if (strcmp(subtype, "Form") == 0) {
             /* Form XObject: recursively interpret its content stream */
             gs_save(ctx);
@@ -4556,7 +4568,9 @@ static void interpret_stream(PdfRenderCtx *ctx, PdfDict *resources,
         /* ── Inline Image (BI/ID/EI) ── */
 
         else if (strcmp(op, "BI") == 0) {
+            PROF_START(inl_img);
             render_inline_image(ctx, &parser);
+            PROF_END(image, inl_img);
         }
 
         /* ── Marked Content (consume operands, no-op) ── */
@@ -4761,6 +4775,9 @@ HBITMAP pdf_render_page(PdfDocument *doc, int page_idx, double scale,
         return NULL;
     if (scale <= 0.0) scale = 1.0;
 
+    /* Initialize profiling for this page render */
+    prof_reset(page_idx, scale);
+
     /* Get the page dictionary */
     PdfObj *page = pdf_get_page(doc, page_idx);
     if (!page) return NULL;
@@ -4873,7 +4890,11 @@ HBITMAP pdf_render_page(PdfDocument *doc, int page_idx, double scale,
 
     if (get_page_content(doc, page, &content_data, &content_len)) {
         if (content_data && content_len > 0 && resources) {
+            PROF_START(interp);
             interpret_stream(&ctx, resources, content_data, content_len);
+            LARGE_INTEGER interp_end;
+            QueryPerformanceCounter(&interp_end);
+            g_prof.interpret_time += interp_end.QuadPart - interp_prof_start.QuadPart;
         }
         free(content_data);
     }
@@ -4885,6 +4906,9 @@ HBITMAP pdf_render_page(PdfDocument *doc, int page_idx, double scale,
             ctx.clip_mask_stack[i] = NULL;
         }
     }
+
+    /* Emit profiling results */
+    prof_emit();
 
     /* Cleanup */
     SelectObject(mem_dc, old_bm);
