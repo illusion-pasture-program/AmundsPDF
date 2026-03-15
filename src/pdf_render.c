@@ -446,6 +446,9 @@ static void gs_init(PdfGraphicsState *gs)
     gs->leading        = 0.0;
     gs->text_render_mode = 0;
     gs->text_rise      = 0.0;
+    /* Color space state: default to unknown (operand-count guessing) */
+    memset(&gs->fill_cs, 0, sizeof(gs->fill_cs));
+    memset(&gs->stroke_cs, 0, sizeof(gs->stroke_cs));
 }
 
 static void gs_save(PdfRenderCtx *ctx)
@@ -496,6 +499,379 @@ static PdfColor cmyk_to_rgb(double c, double m, double y, double k)
     if (rgb.b < 0.0) rgb.b = 0.0;
     if (rgb.b > 1.0) rgb.b = 1.0;
     return rgb;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Color Space Resolution
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Resolve a color space name from the page's /Resources /ColorSpace dictionary
+ * and populate a PdfColorSpaceInfo with the type, component count, and
+ * palette data (for Indexed spaces).
+ */
+
+static void resolve_colorspace(PdfDocument *doc, PdfDict *resources,
+                                const char *cs_name, PdfColorSpaceInfo *info)
+{
+    memset(info, 0, sizeof(*info));
+    strncpy(info->name, cs_name, PDF_MAX_NAME_LEN - 1);
+    info->name[PDF_MAX_NAME_LEN - 1] = '\0';
+
+    /* Handle built-in device color space names */
+    if (strcmp(cs_name, "DeviceGray") == 0 || strcmp(cs_name, "G") == 0) {
+        info->type = PDF_CS_DEVICE_GRAY;
+        info->components = 1;
+        return;
+    }
+    if (strcmp(cs_name, "DeviceRGB") == 0 || strcmp(cs_name, "RGB") == 0) {
+        info->type = PDF_CS_DEVICE_RGB;
+        info->components = 3;
+        return;
+    }
+    if (strcmp(cs_name, "DeviceCMYK") == 0 || strcmp(cs_name, "CMYK") == 0) {
+        info->type = PDF_CS_DEVICE_CMYK;
+        info->components = 4;
+        return;
+    }
+    if (strcmp(cs_name, "Pattern") == 0) {
+        info->type = PDF_CS_PATTERN;
+        info->components = 0;
+        return;
+    }
+
+    /* Look up in page Resources /ColorSpace dictionary */
+    if (!resources) return;
+    PdfObj *cs_dict_obj = pdf_dict_get(resources, "ColorSpace");
+    if (!cs_dict_obj) return;
+    cs_dict_obj = pdf_resolve(doc, cs_dict_obj);
+    if (!cs_dict_obj || cs_dict_obj->type != PDF_OBJ_DICT) return;
+
+    PdfObj *cs_obj = pdf_dict_get(cs_dict_obj->dict, cs_name);
+    if (!cs_obj) return;
+    cs_obj = pdf_resolve(doc, cs_obj);
+    if (!cs_obj) return;
+
+    /* The color space definition can be a name or an array */
+    if (cs_obj->type == PDF_OBJ_NAME) {
+        /* Recurse with the resolved name */
+        resolve_colorspace(doc, resources, cs_obj->name, info);
+        strncpy(info->name, cs_name, PDF_MAX_NAME_LEN - 1);
+        return;
+    }
+
+    if (cs_obj->type != PDF_OBJ_ARRAY) return;
+    PdfArray *arr = cs_obj->array;
+    if (pdf_array_len(arr) < 1) return;
+
+    /* First element is the color space family name */
+    PdfObj *family_obj = pdf_array_get(arr, 0);
+    if (!family_obj) return;
+    family_obj = pdf_resolve(doc, family_obj);
+    if (!family_obj || family_obj->type != PDF_OBJ_NAME) return;
+    const char *family = family_obj->name;
+
+    /* ── ICCBased ── */
+    if (strcmp(family, "ICCBased") == 0 && pdf_array_len(arr) >= 2) {
+        info->type = PDF_CS_ICCBASED;
+        /* The second element is a stream with an /N entry */
+        PdfObj *icc_stream_obj = pdf_array_get(arr, 1);
+        if (icc_stream_obj) {
+            icc_stream_obj = pdf_resolve(doc, icc_stream_obj);
+            if (icc_stream_obj && icc_stream_obj->type == PDF_OBJ_STREAM) {
+                int n = pdf_dict_get_int(icc_stream_obj->stream->dict, "N", 3);
+                info->components = n;
+            } else {
+                info->components = 3; /* default to RGB */
+            }
+        } else {
+            info->components = 3;
+        }
+        return;
+    }
+
+    /* ── Indexed ── [/Indexed base hival lookup] */
+    if (strcmp(family, "Indexed") == 0 && pdf_array_len(arr) >= 4) {
+        info->type = PDF_CS_INDEXED;
+        info->components = 1; /* Indexed always takes 1 operand (the index) */
+
+        /* Resolve the base color space */
+        PdfObj *base_obj = pdf_array_get(arr, 1);
+        if (base_obj) {
+            base_obj = pdf_resolve(doc, base_obj);
+            if (base_obj) {
+                if (base_obj->type == PDF_OBJ_NAME) {
+                    if (strcmp(base_obj->name, "DeviceRGB") == 0) {
+                        info->indexed_base_type = PDF_CS_DEVICE_RGB;
+                        info->indexed_base_components = 3;
+                    } else if (strcmp(base_obj->name, "DeviceCMYK") == 0) {
+                        info->indexed_base_type = PDF_CS_DEVICE_CMYK;
+                        info->indexed_base_components = 4;
+                    } else if (strcmp(base_obj->name, "DeviceGray") == 0) {
+                        info->indexed_base_type = PDF_CS_DEVICE_GRAY;
+                        info->indexed_base_components = 1;
+                    } else {
+                        info->indexed_base_type = PDF_CS_DEVICE_RGB;
+                        info->indexed_base_components = 3;
+                    }
+                } else if (base_obj->type == PDF_OBJ_ARRAY && pdf_array_len(base_obj->array) >= 2) {
+                    /* Base is itself an array, e.g. [/ICCBased ...] */
+                    PdfObj *base_family = pdf_array_get(base_obj->array, 0);
+                    if (base_family) base_family = pdf_resolve(doc, base_family);
+                    if (base_family && base_family->type == PDF_OBJ_NAME &&
+                        strcmp(base_family->name, "ICCBased") == 0) {
+                        PdfObj *icc_obj = pdf_array_get(base_obj->array, 1);
+                        if (icc_obj) icc_obj = pdf_resolve(doc, icc_obj);
+                        if (icc_obj && icc_obj->type == PDF_OBJ_STREAM) {
+                            int n = pdf_dict_get_int(icc_obj->stream->dict, "N", 3);
+                            info->indexed_base_components = n;
+                            if (n == 1) info->indexed_base_type = PDF_CS_DEVICE_GRAY;
+                            else if (n == 4) info->indexed_base_type = PDF_CS_DEVICE_CMYK;
+                            else info->indexed_base_type = PDF_CS_DEVICE_RGB;
+                        } else {
+                            info->indexed_base_type = PDF_CS_DEVICE_RGB;
+                            info->indexed_base_components = 3;
+                        }
+                    } else {
+                        info->indexed_base_type = PDF_CS_DEVICE_RGB;
+                        info->indexed_base_components = 3;
+                    }
+                } else {
+                    info->indexed_base_type = PDF_CS_DEVICE_RGB;
+                    info->indexed_base_components = 3;
+                }
+            }
+        }
+        if (info->indexed_base_components == 0) {
+            info->indexed_base_type = PDF_CS_DEVICE_RGB;
+            info->indexed_base_components = 3;
+        }
+
+        /* hival */
+        PdfObj *hival_obj = pdf_array_get(arr, 2);
+        if (hival_obj) {
+            hival_obj = pdf_resolve(doc, hival_obj);
+            if (hival_obj) {
+                if (hival_obj->type == PDF_OBJ_INT)
+                    info->indexed_hival = (int)hival_obj->integer;
+                else if (hival_obj->type == PDF_OBJ_REAL)
+                    info->indexed_hival = (int)hival_obj->real;
+            }
+        }
+        if (info->indexed_hival > PDF_MAX_INDEXED_PALETTE - 1)
+            info->indexed_hival = PDF_MAX_INDEXED_PALETTE - 1;
+
+        /* lookup table: can be a string or a stream */
+        PdfObj *lookup_obj = pdf_array_get(arr, 3);
+        if (lookup_obj) lookup_obj = pdf_resolve(doc, lookup_obj);
+        if (lookup_obj) {
+            int bpc = info->indexed_base_components;
+            int palette_size = (info->indexed_hival + 1) * bpc;
+            if (palette_size > (int)sizeof(info->indexed_palette))
+                palette_size = (int)sizeof(info->indexed_palette);
+
+            if (lookup_obj->type == PDF_OBJ_STRING) {
+                int copy_len = (int)lookup_obj->string.length;
+                if (copy_len > palette_size) copy_len = palette_size;
+                memcpy(info->indexed_palette, lookup_obj->string.data, copy_len);
+            } else if (lookup_obj->type == PDF_OBJ_STREAM) {
+                if (pdf_decode_stream(doc, lookup_obj->stream)) {
+                    int copy_len = (int)lookup_obj->stream->decoded_length;
+                    if (copy_len > palette_size) copy_len = palette_size;
+                    memcpy(info->indexed_palette, lookup_obj->stream->decoded_data, copy_len);
+                }
+            }
+        }
+        return;
+    }
+
+    /* ── Separation ── [/Separation name alternateSpace tintTransform] */
+    if (strcmp(family, "Separation") == 0 && pdf_array_len(arr) >= 3) {
+        info->type = PDF_CS_SEPARATION;
+        info->components = 1;  /* Separation always takes 1 tint value */
+        /* We approximate by checking the alternate space component count.
+         * A full implementation would evaluate the tint transform function. */
+        if (pdf_array_len(arr) >= 3) {
+            PdfObj *alt_obj = pdf_array_get(arr, 2);
+            if (alt_obj) alt_obj = pdf_resolve(doc, alt_obj);
+            if (alt_obj && alt_obj->type == PDF_OBJ_NAME) {
+                if (strcmp(alt_obj->name, "DeviceCMYK") == 0) {
+                    info->indexed_base_type = PDF_CS_DEVICE_CMYK;
+                    info->indexed_base_components = 4;
+                } else if (strcmp(alt_obj->name, "DeviceRGB") == 0) {
+                    info->indexed_base_type = PDF_CS_DEVICE_RGB;
+                    info->indexed_base_components = 3;
+                } else {
+                    info->indexed_base_type = PDF_CS_DEVICE_GRAY;
+                    info->indexed_base_components = 1;
+                }
+            }
+        }
+        return;
+    }
+
+    /* ── DeviceN ── [/DeviceN names alternateSpace tintTransform] */
+    if (strcmp(family, "DeviceN") == 0 && pdf_array_len(arr) >= 3) {
+        info->type = PDF_CS_DEVICEN;
+        /* Component count = length of the names array */
+        PdfObj *names_obj = pdf_array_get(arr, 1);
+        if (names_obj) names_obj = pdf_resolve(doc, names_obj);
+        if (names_obj && names_obj->type == PDF_OBJ_ARRAY) {
+            info->components = pdf_array_len(names_obj->array);
+        } else {
+            info->components = 1;
+        }
+        return;
+    }
+
+    /* ── CalGray / CalRGB / Lab ── */
+    if (strcmp(family, "CalGray") == 0) {
+        info->type = PDF_CS_DEVICE_GRAY;
+        info->components = 1;
+        return;
+    }
+    if (strcmp(family, "CalRGB") == 0) {
+        info->type = PDF_CS_DEVICE_RGB;
+        info->components = 3;
+        return;
+    }
+    if (strcmp(family, "Lab") == 0) {
+        info->type = PDF_CS_DEVICE_RGB;
+        info->components = 3;
+        return;
+    }
+}
+
+/*
+ * Apply color from scn/SCN operands using the current color space info.
+ * Returns the resolved PdfColor (RGB).
+ */
+static PdfColor resolve_color_from_cs(PdfColorSpaceInfo *cs, OperandStack *ops)
+{
+    PdfColor color = {0.0, 0.0, 0.0};
+
+    switch (cs->type) {
+    case PDF_CS_DEVICE_GRAY: {
+        double gray = opstack_number(ops, ops->count - 1);
+        color.r = color.g = color.b = gray;
+        break;
+    }
+    case PDF_CS_DEVICE_RGB: {
+        if (ops->count >= 3) {
+            color.r = opstack_number(ops, ops->count - 3);
+            color.g = opstack_number(ops, ops->count - 2);
+            color.b = opstack_number(ops, ops->count - 1);
+        }
+        break;
+    }
+    case PDF_CS_DEVICE_CMYK: {
+        if (ops->count >= 4) {
+            double c_ = opstack_number(ops, ops->count - 4);
+            double m_ = opstack_number(ops, ops->count - 3);
+            double y_ = opstack_number(ops, ops->count - 2);
+            double k_ = opstack_number(ops, ops->count - 1);
+            color = cmyk_to_rgb(c_, m_, y_, k_);
+        }
+        break;
+    }
+    case PDF_CS_ICCBASED: {
+        /* Treat like the device space with the same component count */
+        if (cs->components == 1) {
+            double gray = opstack_number(ops, ops->count - 1);
+            color.r = color.g = color.b = gray;
+        } else if (cs->components == 3 && ops->count >= 3) {
+            color.r = opstack_number(ops, ops->count - 3);
+            color.g = opstack_number(ops, ops->count - 2);
+            color.b = opstack_number(ops, ops->count - 1);
+        } else if (cs->components == 4 && ops->count >= 4) {
+            double c_ = opstack_number(ops, ops->count - 4);
+            double m_ = opstack_number(ops, ops->count - 3);
+            double y_ = opstack_number(ops, ops->count - 2);
+            double k_ = opstack_number(ops, ops->count - 1);
+            color = cmyk_to_rgb(c_, m_, y_, k_);
+        }
+        break;
+    }
+    case PDF_CS_INDEXED: {
+        /* Operand is a palette index */
+        int idx = (int)opstack_number(ops, ops->count - 1);
+        if (idx < 0) idx = 0;
+        if (idx > cs->indexed_hival) idx = cs->indexed_hival;
+        int bpc = cs->indexed_base_components;
+        if (bpc < 1) bpc = 3; /* fallback */
+        int offset = idx * bpc;
+
+        if (cs->indexed_base_type == PDF_CS_DEVICE_CMYK && bpc == 4) {
+            double c_ = cs->indexed_palette[offset + 0] / 255.0;
+            double m_ = cs->indexed_palette[offset + 1] / 255.0;
+            double y_ = cs->indexed_palette[offset + 2] / 255.0;
+            double k_ = cs->indexed_palette[offset + 3] / 255.0;
+            color = cmyk_to_rgb(c_, m_, y_, k_);
+        } else if (cs->indexed_base_type == PDF_CS_DEVICE_GRAY && bpc == 1) {
+            double gray = cs->indexed_palette[offset] / 255.0;
+            color.r = color.g = color.b = gray;
+        } else {
+            /* RGB or ICCBased with 3 components */
+            color.r = cs->indexed_palette[offset + 0] / 255.0;
+            color.g = cs->indexed_palette[offset + 1] / 255.0;
+            color.b = cs->indexed_palette[offset + 2] / 255.0;
+        }
+        break;
+    }
+    case PDF_CS_SEPARATION: {
+        /* Approximation: use tint value as gray, or as intensity */
+        double tint = opstack_number(ops, ops->count - 1);
+        /* Without evaluating the tint transform, approximate:
+         * For Separation spaces with CMYK alternate, use tint as key (darkness) */
+        if (cs->indexed_base_type == PDF_CS_DEVICE_CMYK) {
+            /* Approximate: treat as all-zero CMYK with the tint applied uniformly
+             * This is a rough heuristic; a real solution evaluates the function */
+            double gray = 1.0 - tint;
+            color.r = color.g = color.b = gray;
+        } else {
+            /* Generic fallback: tint 0 = white, tint 1 = black */
+            double gray = 1.0 - tint;
+            color.r = color.g = color.b = gray;
+        }
+        break;
+    }
+    case PDF_CS_DEVICEN: {
+        /* Rough approximation: treat multiple components as CMYK or ignore.
+         * For now, use the operand-count-based fallback. */
+        if (ops->count >= 4) {
+            double c_ = opstack_number(ops, ops->count - 4);
+            double m_ = opstack_number(ops, ops->count - 3);
+            double y_ = opstack_number(ops, ops->count - 2);
+            double k_ = opstack_number(ops, ops->count - 1);
+            color = cmyk_to_rgb(c_, m_, y_, k_);
+        } else if (ops->count >= 3) {
+            color.r = opstack_number(ops, ops->count - 3);
+            color.g = opstack_number(ops, ops->count - 2);
+            color.b = opstack_number(ops, ops->count - 1);
+        } else if (ops->count >= 1) {
+            double gray = opstack_number(ops, ops->count - 1);
+            color.r = color.g = color.b = gray;
+        }
+        break;
+    }
+    default:
+        /* Fall through to operand-count guessing below */
+        if (ops->count >= 4) {
+            double c_ = opstack_number(ops, ops->count - 4);
+            double m_ = opstack_number(ops, ops->count - 3);
+            double y_ = opstack_number(ops, ops->count - 2);
+            double k_ = opstack_number(ops, ops->count - 1);
+            color = cmyk_to_rgb(c_, m_, y_, k_);
+        } else if (ops->count >= 3) {
+            color.r = opstack_number(ops, ops->count - 3);
+            color.g = opstack_number(ops, ops->count - 2);
+            color.b = opstack_number(ops, ops->count - 1);
+        } else if (ops->count >= 1) {
+            double gray = opstack_number(ops, ops->count - 1);
+            color.r = color.g = color.b = gray;
+        }
+        break;
+    }
+    return color;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -2992,13 +3368,12 @@ static void render_inline_image(PdfRenderCtx *ctx, CSParser *p)
     if (is_image_mask && bpc == 1) {
         /* 1-bit image mask: render as stencil with current fill color.
          * Bits are packed MSB-first. Each row is padded to byte boundary.
-         * Use a magic transparent color (RGB 255,0,255 magenta) for
-         * non-painted pixels, then use TransparentBlt to composite. */
-        uint8_t tr_r = 255, tr_g = 0, tr_b = 255; /* transparent color: magenta */
-        /* If fill color is magenta, use a different transparent color */
-        if (fr == 255 && fg == 0 && fb == 255) {
-            tr_r = 0; tr_g = 255; tr_b = 0; /* use green instead */
-        }
+         *
+         * We use premultiplied alpha + AlphaBlend for anti-aliased scaling:
+         * painted pixels get fill color with alpha=255, transparent pixels
+         * get RGBA(0,0,0,0). When AlphaBlend scales the image with HALFTONE
+         * mode, it interpolates the alpha channel, producing smooth edges
+         * instead of the jagged nearest-neighbor result from TransparentBlt. */
 
         for (int py = 0; py < img_height; py++) {
             const uint8_t *row = img_data + (size_t)py * row_bytes;
@@ -3022,20 +3397,24 @@ static void render_inline_image(PdfRenderCtx *ctx, CSParser *p)
 
                 size_t dst_idx = ((size_t)py * img_width + px) * 4;
                 if (painted) {
+                    /* Premultiplied alpha: color values are already at full
+                     * intensity since alpha=255, so no multiplication needed */
                     dib_bits[dst_idx + 0] = fb;   /* Blue */
                     dib_bits[dst_idx + 1] = fg;   /* Green */
                     dib_bits[dst_idx + 2] = fr;   /* Red */
-                    dib_bits[dst_idx + 3] = 255;
+                    dib_bits[dst_idx + 3] = 255;  /* Fully opaque */
                 } else {
-                    dib_bits[dst_idx + 0] = tr_b; /* Blue */
-                    dib_bits[dst_idx + 1] = tr_g; /* Green */
-                    dib_bits[dst_idx + 2] = tr_r; /* Red */
-                    dib_bits[dst_idx + 3] = 255;
+                    /* Fully transparent: all channels must be 0 for
+                     * premultiplied alpha (color * 0/255 = 0) */
+                    dib_bits[dst_idx + 0] = 0;
+                    dib_bits[dst_idx + 1] = 0;
+                    dib_bits[dst_idx + 2] = 0;
+                    dib_bits[dst_idx + 3] = 0;    /* Fully transparent */
                 }
             }
         }
 
-        /* Blit with transparency: use TransparentBlt to skip transparent-color pixels */
+        /* Blit with alpha blending for smooth anti-aliased scaling */
         PdfMatrix m = current_gs(ctx)->ctm;
         double x0, y0, x1, y1, x2, y2, x3, y3;
         pdf_transform_point(m, 0.0, 0.0, &x0, &y0);
@@ -3060,10 +3439,17 @@ static void render_inline_image(PdfRenderCtx *ctx, CSParser *p)
 
         HDC mem_dc = CreateCompatibleDC(ctx->hdc);
         HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
-        SetStretchBltMode(ctx->hdc, COLORONCOLOR);
-        COLORREF trans_color = RGB(tr_r, tr_g, tr_b);
-        TransparentBlt(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
-                       mem_dc, 0, 0, img_width, img_height, trans_color);
+        SetStretchBltMode(ctx->hdc, HALFTONE);
+
+        BLENDFUNCTION bf;
+        bf.BlendOp = AC_SRC_OVER;
+        bf.BlendFlags = 0;
+        bf.SourceConstantAlpha = 255;    /* use per-pixel alpha */
+        bf.AlphaFormat = AC_SRC_ALPHA;   /* source has premultiplied alpha */
+
+        AlphaBlend(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
+                   mem_dc, 0, 0, img_width, img_height, bf);
+
         SelectObject(mem_dc, old_bm);
         DeleteDC(mem_dc);
         DeleteObject(hbm);
@@ -3385,45 +3771,59 @@ static void interpret_stream(PdfRenderCtx *ctx, PdfDict *resources,
             current_gs(ctx)->stroke_color = cmyk_to_rgb(c_, m_, y_, k_);
         }
         else if (strcmp(op, "cs") == 0 && ops.count >= 1) {
-            /* Set fill color space. For DeviceGray/RGB/CMYK the operand count
-             * in subsequent sc/scn calls determines the interpretation.
-             * We don't need to store this explicitly for basic color spaces. */
+            /* Set fill color space: resolve from resources */
+            const char *cs_name = opstack_name(&ops, ops.count - 1);
+            resolve_colorspace(ctx->doc, resources, cs_name, &current_gs(ctx)->fill_cs);
         }
         else if (strcmp(op, "CS") == 0 && ops.count >= 1) {
-            /* Set stroke color space -- same approach as cs */
+            /* Set stroke color space: resolve from resources */
+            const char *cs_name = opstack_name(&ops, ops.count - 1);
+            resolve_colorspace(ctx->doc, resources, cs_name, &current_gs(ctx)->stroke_cs);
         }
         else if (strcmp(op, "sc") == 0 || strcmp(op, "scn") == 0) {
-            /* Set fill color based on operand count */
-            if (ops.count >= 4) {
-                double c_ = opstack_number(&ops, ops.count - 4);
-                double m_ = opstack_number(&ops, ops.count - 3);
-                double y_ = opstack_number(&ops, ops.count - 2);
-                double k_ = opstack_number(&ops, ops.count - 1);
-                current_gs(ctx)->fill_color = cmyk_to_rgb(c_, m_, y_, k_);
-            } else if (ops.count >= 3) {
-                current_gs(ctx)->fill_color.r = opstack_number(&ops, ops.count - 3);
-                current_gs(ctx)->fill_color.g = opstack_number(&ops, ops.count - 2);
-                current_gs(ctx)->fill_color.b = opstack_number(&ops, ops.count - 1);
-            } else if (ops.count >= 1) {
-                double gray = opstack_number(&ops, ops.count - 1);
-                current_gs(ctx)->fill_color = (PdfColor){gray, gray, gray};
+            /* Set fill color using active fill color space */
+            if (current_gs(ctx)->fill_cs.type != PDF_CS_UNKNOWN) {
+                current_gs(ctx)->fill_color = resolve_color_from_cs(
+                    &current_gs(ctx)->fill_cs, &ops);
+            } else {
+                /* Fallback: operand-count guessing (no cs was called) */
+                if (ops.count >= 4) {
+                    double c_ = opstack_number(&ops, ops.count - 4);
+                    double m_ = opstack_number(&ops, ops.count - 3);
+                    double y_ = opstack_number(&ops, ops.count - 2);
+                    double k_ = opstack_number(&ops, ops.count - 1);
+                    current_gs(ctx)->fill_color = cmyk_to_rgb(c_, m_, y_, k_);
+                } else if (ops.count >= 3) {
+                    current_gs(ctx)->fill_color.r = opstack_number(&ops, ops.count - 3);
+                    current_gs(ctx)->fill_color.g = opstack_number(&ops, ops.count - 2);
+                    current_gs(ctx)->fill_color.b = opstack_number(&ops, ops.count - 1);
+                } else if (ops.count >= 1) {
+                    double gray = opstack_number(&ops, ops.count - 1);
+                    current_gs(ctx)->fill_color = (PdfColor){gray, gray, gray};
+                }
             }
         }
         else if (strcmp(op, "SC") == 0 || strcmp(op, "SCN") == 0) {
-            /* Set stroke color based on operand count */
-            if (ops.count >= 4) {
-                double c_ = opstack_number(&ops, ops.count - 4);
-                double m_ = opstack_number(&ops, ops.count - 3);
-                double y_ = opstack_number(&ops, ops.count - 2);
-                double k_ = opstack_number(&ops, ops.count - 1);
-                current_gs(ctx)->stroke_color = cmyk_to_rgb(c_, m_, y_, k_);
-            } else if (ops.count >= 3) {
-                current_gs(ctx)->stroke_color.r = opstack_number(&ops, ops.count - 3);
-                current_gs(ctx)->stroke_color.g = opstack_number(&ops, ops.count - 2);
-                current_gs(ctx)->stroke_color.b = opstack_number(&ops, ops.count - 1);
-            } else if (ops.count >= 1) {
-                double gray = opstack_number(&ops, ops.count - 1);
-                current_gs(ctx)->stroke_color = (PdfColor){gray, gray, gray};
+            /* Set stroke color using active stroke color space */
+            if (current_gs(ctx)->stroke_cs.type != PDF_CS_UNKNOWN) {
+                current_gs(ctx)->stroke_color = resolve_color_from_cs(
+                    &current_gs(ctx)->stroke_cs, &ops);
+            } else {
+                /* Fallback: operand-count guessing (no CS was called) */
+                if (ops.count >= 4) {
+                    double c_ = opstack_number(&ops, ops.count - 4);
+                    double m_ = opstack_number(&ops, ops.count - 3);
+                    double y_ = opstack_number(&ops, ops.count - 2);
+                    double k_ = opstack_number(&ops, ops.count - 1);
+                    current_gs(ctx)->stroke_color = cmyk_to_rgb(c_, m_, y_, k_);
+                } else if (ops.count >= 3) {
+                    current_gs(ctx)->stroke_color.r = opstack_number(&ops, ops.count - 3);
+                    current_gs(ctx)->stroke_color.g = opstack_number(&ops, ops.count - 2);
+                    current_gs(ctx)->stroke_color.b = opstack_number(&ops, ops.count - 1);
+                } else if (ops.count >= 1) {
+                    double gray = opstack_number(&ops, ops.count - 1);
+                    current_gs(ctx)->stroke_color = (PdfColor){gray, gray, gray};
+                }
             }
         }
 
