@@ -1632,6 +1632,178 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
     bool has_pdf_widths = font_has_pdf_widths(ctx->doc, resources, gs->font_name);
     double abs_font_height_px = fabs((double)font_height_px);
 
+    /* ─── Check for Type0/CID composite font (2-byte character codes) ─── */
+    {
+        PdfDict *font_dict = resolve_font_dict(ctx->doc, resources, gs->font_name);
+        if (font_dict) {
+            const char *subtype = pdf_dict_get_name(font_dict, "Subtype");
+            if (subtype && strcmp(subtype, "Type0") == 0) {
+                /* Type0 font: read 2-byte CIDs and map to Unicode via ToUnicode */
+                const char *encoding = pdf_dict_get_name(font_dict, "Encoding");
+                bool is_identity = encoding && (strcmp(encoding, "Identity-H") == 0 ||
+                                                 strcmp(encoding, "Identity-V") == 0);
+                if (is_identity && len >= 2) {
+                    /* Parse ToUnicode CMap for CID → Unicode mapping */
+                    uint16_t tounicode_map[65536];
+                    memset(tounicode_map, 0, sizeof(tounicode_map));
+                    int has_tounicode = 0;
+
+                    PdfObj *tounicode_obj = pdf_dict_get(font_dict, "ToUnicode");
+                    if (tounicode_obj) {
+                        tounicode_obj = pdf_resolve(ctx->doc, tounicode_obj);
+                        if (tounicode_obj && tounicode_obj->type == PDF_OBJ_STREAM) {
+                            PdfStream *tu_stream = tounicode_obj->stream;
+                            if (!tu_stream->decoded_data)
+                                pdf_decode_stream(ctx->doc, tu_stream);
+                            if (tu_stream->decoded_data) {
+                                /* Simple CMap parser: look for beginbfchar/endbfchar
+                                 * and beginbfrange/endbfrange sections */
+                                const char *s = (const char *)tu_stream->decoded_data;
+                                size_t slen = tu_stream->decoded_length;
+                                const char *end = s + slen;
+                                has_tounicode = 1;
+
+                                while (s < end) {
+                                    /* Skip to next '<' */
+                                    const char *lt = memchr(s, '<', end - s);
+                                    if (!lt) break;
+
+                                    /* Check if this is in a bfchar or bfrange section */
+                                    /* Parse: <XXXX> <YYYY> for bfchar mapping */
+                                    if (lt + 5 < end && lt[5] == '>') {
+                                        /* 4-digit hex: <XXXX> */
+                                        unsigned int cid = 0;
+                                        if (sscanf(lt + 1, "%4x", &cid) == 1 && cid < 65536) {
+                                            /* Look for next <YYYY> */
+                                            const char *gt = lt + 6;
+                                            while (gt < end && *gt == ' ') gt++;
+                                            if (gt < end && *gt == '<' && gt + 5 < end && gt[5] == '>') {
+                                                unsigned int unicode = 0;
+                                                if (sscanf(gt + 1, "%4x", &unicode) == 1) {
+                                                    tounicode_map[cid] = (uint16_t)unicode;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    s = lt + 1;
+                                }
+                            }
+                        }
+                    }
+
+                    /* Get CID width info from DescendantFonts */
+                    PdfObj *descendants = pdf_dict_get(font_dict, "DescendantFonts");
+                    PdfDict *cid_font_dict = NULL;
+                    int default_w = 1000;
+                    PdfArray *w_array = NULL;
+
+                    if (descendants) {
+                        descendants = pdf_resolve(ctx->doc, descendants);
+                        if (descendants && descendants->type == PDF_OBJ_ARRAY) {
+                            PdfObj *first = pdf_array_get(descendants->array, 0);
+                            if (first) first = pdf_resolve(ctx->doc, first);
+                            if (first && first->type == PDF_OBJ_DICT) {
+                                cid_font_dict = first->dict;
+                                default_w = pdf_dict_get_int(cid_font_dict, "DW", 1000);
+                                PdfObj *w_obj = pdf_dict_get(cid_font_dict, "W");
+                                if (w_obj) {
+                                    w_obj = pdf_resolve(ctx->doc, w_obj);
+                                    if (w_obj && w_obj->type == PDF_OBJ_ARRAY)
+                                        w_array = w_obj->array;
+                                }
+                            }
+                        }
+                    }
+
+                    /* Render 2-byte CID characters */
+                    for (size_t i = 0; i + 1 < len; i += 2) {
+                        int cid = ((int)str[i] << 8) | (int)str[i + 1];
+
+                        /* Map CID to Unicode via ToUnicode */
+                        wchar_t wc = 0;
+                        if (has_tounicode && cid < 65536) {
+                            wc = (wchar_t)tounicode_map[cid];
+                        }
+                        if (wc == 0) wc = (wchar_t)cid;
+
+                        /* Render if not invisible and not control char */
+                        if (gs->text_render_mode != 3 && wc >= 0x20) {
+                            PdfMatrix combined = pdf_matrix_multiply(ctx->text_matrix, gs->ctm);
+                            double ox, oy;
+                            pdf_transform_point(combined, 0, gs->text_rise, &ox, &oy);
+                            int dx = (int)floor(ox + 0.5);
+                            int dy = (int)floor(oy + 0.5);
+                            TextOutW(hdc, dx, dy, &wc, 1);
+                        }
+
+                        /* Get CID width from /W array */
+                        double cid_width = (double)default_w;
+                        if (w_array) {
+                            int n = pdf_array_len(w_array);
+                            int wi = 0;
+                            while (wi < n) {
+                                PdfObj *first_obj = pdf_array_get(w_array, wi);
+                                if (!first_obj) break;
+                                first_obj = pdf_resolve(ctx->doc, first_obj);
+                                if (!first_obj || first_obj->type != PDF_OBJ_INT) break;
+                                int first_cid = (int)first_obj->integer;
+                                wi++;
+                                if (wi >= n) break;
+                                PdfObj *second = pdf_array_get(w_array, wi);
+                                if (!second) break;
+                                second = pdf_resolve(ctx->doc, second);
+                                if (!second) break;
+                                if (second->type == PDF_OBJ_ARRAY) {
+                                    int offset = cid - first_cid;
+                                    int wcount = pdf_array_len(second->array);
+                                    if (offset >= 0 && offset < wcount) {
+                                        PdfObj *wv = pdf_array_get(second->array, offset);
+                                        if (wv) wv = pdf_resolve(ctx->doc, wv);
+                                        if (wv) {
+                                            if (wv->type == PDF_OBJ_INT) cid_width = (double)wv->integer;
+                                            else if (wv->type == PDF_OBJ_REAL) cid_width = wv->real;
+                                        }
+                                    }
+                                    wi++;
+                                } else if (second->type == PDF_OBJ_INT) {
+                                    int last_cid = (int)second->integer;
+                                    wi++;
+                                    if (wi >= n) break;
+                                    PdfObj *wv = pdf_array_get(w_array, wi);
+                                    if (wv) wv = pdf_resolve(ctx->doc, wv);
+                                    wi++;
+                                    if (cid >= first_cid && cid <= last_cid && wv) {
+                                        if (wv->type == PDF_OBJ_INT) cid_width = (double)wv->integer;
+                                        else if (wv->type == PDF_OBJ_REAL) cid_width = wv->real;
+                                    }
+                                } else break;
+                            }
+                        }
+
+                        /* Advance text position */
+                        double advance = cid_width / 1000.0 * font_size;
+                        advance += gs->char_spacing;
+                        if (wc == 0x20 || cid == 0x0003)
+                            advance += gs->word_spacing;
+                        advance *= h_scale;
+
+                        PdfMatrix adv = PDF_IDENTITY_MATRIX;
+                        adv.e = advance;
+                        ctx->text_matrix = pdf_matrix_multiply(adv, ctx->text_matrix);
+                    }
+
+                    /* Cleanup and return */
+                    SetTextAlign(hdc, TA_TOP | TA_LEFT);
+                    SelectObject(hdc, old_font);
+                    DeleteObject(hfont);
+                    return;
+                }
+            }
+        }
+    }
+
+    /* ─── Simple Font Path (1-byte character codes) ─── */
+
     /* Render each character individually for accurate positioning */
     for (size_t i = 0; i < len; i++) {
         int char_code = str[i];
