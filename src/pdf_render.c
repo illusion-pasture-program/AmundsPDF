@@ -861,6 +861,218 @@ static int get_gdi_char_width(HDC hdc, int char_code, double font_size_px)
 }
 
 /*
+ * Resolve a font dictionary from the page resources given a font resource name.
+ * Returns the resolved PdfDict* for the font, or NULL if not found.
+ */
+static PdfDict *resolve_font_dict(PdfDocument *doc, PdfDict *resources,
+                                   const char *font_name)
+{
+    PdfObj *fonts_obj = pdf_dict_get(resources, "Font");
+    if (!fonts_obj) return NULL;
+    fonts_obj = pdf_resolve(doc, fonts_obj);
+    if (!fonts_obj || fonts_obj->type != PDF_OBJ_DICT) return NULL;
+
+    PdfObj *font_obj = pdf_dict_get(fonts_obj->dict, font_name);
+    if (!font_obj) return NULL;
+    font_obj = pdf_resolve(doc, font_obj);
+    if (!font_obj || font_obj->type != PDF_OBJ_DICT) return NULL;
+
+    return font_obj->dict;
+}
+
+/* Forward declaration for interpret_stream (needed by render_type3_string) */
+static void interpret_stream(PdfRenderCtx *ctx, PdfDict *resources,
+                              const uint8_t *data, size_t length);
+
+/*
+ * Build a char_code -> glyph_name mapping for a Type3 font from its /Encoding.
+ * Type3 fonts typically use a custom encoding with /Differences.
+ * The glyph names correspond to keys in /CharProcs.
+ */
+static void build_type3_encoding(PdfDocument *doc, PdfDict *font_dict,
+                                  char glyph_names[256][64])
+{
+    memset(glyph_names, 0, 256 * 64);
+
+    PdfObj *enc_obj = pdf_dict_get(font_dict, "Encoding");
+    if (!enc_obj) return;
+    enc_obj = pdf_resolve(doc, enc_obj);
+    if (!enc_obj) return;
+
+    if (enc_obj->type == PDF_OBJ_DICT) {
+        /* Encoding dictionary with /Differences */
+        PdfObj *diff_obj = pdf_dict_get(enc_obj->dict, "Differences");
+        if (diff_obj) {
+            diff_obj = pdf_resolve(doc, diff_obj);
+            if (diff_obj && diff_obj->type == PDF_OBJ_ARRAY) {
+                int current_code = 0;
+                int n = pdf_array_len(diff_obj->array);
+                for (int i = 0; i < n; i++) {
+                    PdfObj *item = pdf_array_get(diff_obj->array, i);
+                    if (!item) continue;
+                    item = pdf_resolve(doc, item);
+                    if (!item) continue;
+                    if (item->type == PDF_OBJ_INT) {
+                        current_code = (int)item->integer;
+                    } else if (item->type == PDF_OBJ_NAME && item->name) {
+                        if (current_code >= 0 && current_code < 256) {
+                            strncpy(glyph_names[current_code], item->name, 63);
+                            glyph_names[current_code][63] = '\0';
+                        }
+                        current_code++;
+                    }
+                }
+            }
+        }
+    }
+    /* Named encodings are rare for Type3 but handle for safety */
+    /* Type3 fonts almost always use /Differences */
+}
+
+/*
+ * Render a Type3 font text string.
+ * Type3 fonts define each glyph as a mini PDF content stream in /CharProcs.
+ * We look up each character's glyph stream and interpret it using the
+ * existing content stream interpreter, with appropriate coordinate transforms.
+ */
+static void render_type3_string(PdfRenderCtx *ctx, PdfDict *resources,
+                                 PdfDict *font_dict, const uint8_t *str, size_t len)
+{
+    PdfGraphicsState *gs = current_gs(ctx);
+
+    /* Get FontMatrix (glyph units -> text space), default [0.001 0 0 0.001 0 0] */
+    double fm[6] = {0.001, 0.0, 0.0, 0.001, 0.0, 0.0};
+    PdfArray *font_matrix = pdf_dict_get_array(font_dict, "FontMatrix");
+    if (font_matrix && pdf_array_len(font_matrix) >= 6) {
+        for (int i = 0; i < 6; i++) {
+            PdfObj *v = pdf_resolve(ctx->doc, pdf_array_get(font_matrix, i));
+            if (v) {
+                if (v->type == PDF_OBJ_REAL) fm[i] = v->real;
+                else if (v->type == PDF_OBJ_INT) fm[i] = (double)v->integer;
+            }
+        }
+    }
+
+    /* Get Widths array and FirstChar */
+    PdfObj *widths_obj = pdf_dict_get(font_dict, "Widths");
+    if (widths_obj) widths_obj = pdf_resolve(ctx->doc, widths_obj);
+    int first_char = pdf_dict_get_int(font_dict, "FirstChar", 0);
+
+    /* Get CharProcs dictionary */
+    PdfObj *char_procs = pdf_dict_get(font_dict, "CharProcs");
+    if (!char_procs) return;
+    char_procs = pdf_resolve(ctx->doc, char_procs);
+    if (!char_procs || char_procs->type != PDF_OBJ_DICT) return;
+
+    /* Get font's own Resources (or inherit from page) */
+    PdfObj *font_resources_obj = pdf_dict_get(font_dict, "Resources");
+    PdfDict *font_resources = resources;
+    if (font_resources_obj) {
+        font_resources_obj = pdf_resolve(ctx->doc, font_resources_obj);
+        if (font_resources_obj && font_resources_obj->type == PDF_OBJ_DICT)
+            font_resources = font_resources_obj->dict;
+    }
+
+    /* Build char_code -> glyph_name mapping from Encoding */
+    char (*glyph_names)[64] = (char (*)[64])calloc(256, 64);
+    if (!glyph_names) return;
+    build_type3_encoding(ctx->doc, font_dict, glyph_names);
+
+    /* Horizontal scaling */
+    double h_scale = gs->horiz_scaling / 100.0;
+
+    for (size_t i = 0; i < len; i++) {
+        int code = (int)str[i];
+
+        /* Get glyph name from encoding */
+        const char *glyph_name = glyph_names[code];
+        if (!glyph_name || glyph_name[0] == '\0') {
+            /* No glyph for this code; just advance using width */
+            goto advance_type3;
+        }
+
+        /* Get glyph stream from CharProcs */
+        PdfObj *glyph_obj = pdf_dict_get(char_procs->dict, glyph_name);
+        if (glyph_obj) glyph_obj = pdf_resolve(ctx->doc, glyph_obj);
+
+        if (glyph_obj && glyph_obj->type == PDF_OBJ_STREAM) {
+            /* Decode the stream if needed */
+            if (!glyph_obj->stream->decoded_data)
+                pdf_decode_stream(ctx->doc, glyph_obj->stream);
+
+            if (glyph_obj->stream->decoded_data) {
+                /* Save graphics state */
+                gs_save(ctx);
+
+                /* Build transformation: FontMatrix * font_size -> text space,
+                 * then text_matrix * CTM -> device space.
+                 *
+                 * The full transform for a Type3 glyph is:
+                 *   FontMatrix x [fontSize 0 0 fontSize 0 0] x text_matrix x CTM
+                 *
+                 * This maps glyph space -> text space -> user space -> device space.
+                 */
+                PdfMatrix fm_matrix = {fm[0], fm[1], fm[2], fm[3], fm[4], fm[5]};
+                PdfMatrix size_matrix = {gs->font_size, 0.0, 0.0, gs->font_size, 0.0, 0.0};
+                PdfMatrix glyph_to_text = pdf_matrix_multiply(fm_matrix, size_matrix);
+                PdfMatrix glyph_to_device = pdf_matrix_multiply(
+                    pdf_matrix_multiply(glyph_to_text, ctx->text_matrix), gs->ctm);
+
+                /* Set the CTM for glyph rendering */
+                current_gs(ctx)->ctm = glyph_to_device;
+
+                /* Interpret the glyph content stream */
+                interpret_stream(ctx, font_resources,
+                                 glyph_obj->stream->decoded_data,
+                                 glyph_obj->stream->decoded_length);
+
+                /* Restore graphics state */
+                gs_restore(ctx);
+                gs = current_gs(ctx); /* re-acquire after restore */
+            }
+        }
+
+advance_type3:
+        /* Advance text position using Widths */
+        {
+            double advance = 0;
+            if (widths_obj && widths_obj->type == PDF_OBJ_ARRAY) {
+                int idx = code - first_char;
+                if (idx >= 0 && idx < pdf_array_len(widths_obj->array)) {
+                    PdfObj *w = pdf_array_get(widths_obj->array, idx);
+                    if (w) w = pdf_resolve(ctx->doc, w);
+                    if (w) {
+                        if (w->type == PDF_OBJ_REAL) advance = w->real;
+                        else if (w->type == PDF_OBJ_INT) advance = (double)w->integer;
+                    }
+                }
+            }
+
+            /* The width is in glyph space. Apply FontMatrix to convert to text space,
+             * then multiply by font_size. For most Type3 fonts, FontMatrix[0] handles
+             * the x-axis scaling. */
+            advance *= fm[0] * gs->font_size;
+
+            /* Add character spacing */
+            advance += gs->char_spacing;
+
+            /* Add word spacing for space characters (code 32) */
+            if (code == 32) advance += gs->word_spacing;
+
+            /* Apply horizontal scaling */
+            advance *= h_scale;
+
+            /* Update text matrix */
+            PdfMatrix adv = PDF_IDENTITY_MATRIX;
+            adv.e = advance;
+            ctx->text_matrix = pdf_matrix_multiply(adv, ctx->text_matrix);
+        }
+    }
+
+    free(glyph_names);
+}
+
+/*
  * Render a text string at the current text position.
  * Updates the text matrix to advance past the rendered text.
  */
@@ -868,6 +1080,20 @@ static void render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
                                 const uint8_t *str, size_t len)
 {
     if (len == 0) return;
+
+    /* Check if this is a Type3 font. Type3 fonts define glyphs as mini PDF
+     * content streams rather than outline data, so they need special handling. */
+    {
+        PdfGraphicsState *gs = current_gs(ctx);
+        PdfDict *font_dict = resolve_font_dict(ctx->doc, resources, gs->font_name);
+        if (font_dict) {
+            const char *subtype = pdf_dict_get_name(font_dict, "Subtype");
+            if (subtype && strcmp(subtype, "Type3") == 0) {
+                render_type3_string(ctx, resources, font_dict, str, len);
+                return;
+            }
+        }
+    }
 
     /* Try the software rasterizer path first for anti-aliased rendering.
      * glyph_render_text_string will extract embedded font outlines, render
@@ -1741,14 +1967,24 @@ static void do_xobject(PdfRenderCtx *ctx, PdfDict *resources, const char *name)
 }
 
 /*
- * Skip inline image data (BI...ID...EI).
- * After seeing "BI", we need to skip the image dictionary and data
- * until we find "EI".
+ * Render an inline image (BI...ID...EI).
+ * Parses the inline image dictionary, extracts pixel data, and renders
+ * it to the DC using the current CTM.
+ *
+ * This handles both regular inline images and 1-bit image masks used
+ * by Type3 font glyph streams.
  */
-static void skip_inline_image(CSParser *p)
+static void render_inline_image(PdfRenderCtx *ctx, CSParser *p)
 {
-    /* We're past "BI". First skip the image dictionary key-value pairs
-     * until we find "ID". */
+    /* Parse inline image dictionary key/value pairs until "ID" */
+    int img_width = 0, img_height = 0, bpc = 8;
+    bool is_image_mask = false;
+    bool decode_inverted = false; /* true if Decode is [1 0] */
+    int components = 1;
+    /* Abbreviated inline image keys:
+     * /W = Width, /H = Height, /BPC = BitsPerComponent
+     * /IM = ImageMask, /D = Decode, /CS = ColorSpace */
+
     while (!cs_at_end(p)) {
         cs_skip_whitespace_and_comments(p);
         if (cs_at_end(p)) break;
@@ -1763,31 +1999,238 @@ static void skip_inline_image(CSParser *p)
             }
         }
 
-        /* Skip this token */
-        CSToken dummy;
-        if (!cs_next_token(p, &dummy)) break;
-        if (dummy.str_data) free(dummy.str_data);
+        /* Parse a token */
+        CSToken key_tok;
+        if (!cs_next_token(p, &key_tok)) break;
+
+        if (key_tok.type == TOK_NAME) {
+            /* Read the value token */
+            CSToken val_tok;
+            if (!cs_next_token(p, &val_tok)) {
+                if (key_tok.str_data) free(key_tok.str_data);
+                break;
+            }
+
+            /* Match abbreviated or full key names */
+            if (strcmp(key_tok.text, "W") == 0 || strcmp(key_tok.text, "Width") == 0) {
+                img_width = (int)val_tok.number;
+            } else if (strcmp(key_tok.text, "H") == 0 || strcmp(key_tok.text, "Height") == 0) {
+                img_height = (int)val_tok.number;
+            } else if (strcmp(key_tok.text, "BPC") == 0 || strcmp(key_tok.text, "BitsPerComponent") == 0) {
+                bpc = (int)val_tok.number;
+            } else if (strcmp(key_tok.text, "IM") == 0 || strcmp(key_tok.text, "ImageMask") == 0) {
+                is_image_mask = val_tok.bool_val;
+            } else if (strcmp(key_tok.text, "CS") == 0 || strcmp(key_tok.text, "ColorSpace") == 0) {
+                /* Parse color space name */
+                if (strcmp(val_tok.text, "RGB") == 0 || strcmp(val_tok.text, "DeviceRGB") == 0) {
+                    components = 3;
+                } else if (strcmp(val_tok.text, "G") == 0 || strcmp(val_tok.text, "DeviceGray") == 0) {
+                    components = 1;
+                } else if (strcmp(val_tok.text, "CMYK") == 0 || strcmp(val_tok.text, "DeviceCMYK") == 0) {
+                    components = 4;
+                }
+            } else if (strcmp(key_tok.text, "D") == 0 || strcmp(key_tok.text, "Decode") == 0) {
+                /* Decode array: for image masks, [1 0] means inverted.
+                 * The value token might be '[', so we need to handle the array.
+                 * For simplicity, if we see '[', read tokens until ']'. */
+                if (val_tok.type == TOK_ARRAY_BEGIN) {
+                    CSToken d0_tok, d1_tok, end_tok;
+                    if (cs_next_token(p, &d0_tok) && cs_next_token(p, &d1_tok)) {
+                        if (d0_tok.number == 1.0 && d1_tok.number == 0.0) {
+                            decode_inverted = true;
+                        }
+                        if (d0_tok.str_data) free(d0_tok.str_data);
+                        if (d1_tok.str_data) free(d1_tok.str_data);
+                    }
+                    /* consume ']' */
+                    if (cs_next_token(p, &end_tok)) {
+                        if (end_tok.str_data) free(end_tok.str_data);
+                    }
+                }
+            }
+            /* /F or /Filter -- we ignore filters for inline images in Type3 glyphs
+             * since they're typically uncompressed raw bitmap data */
+
+            if (val_tok.str_data) free(val_tok.str_data);
+        }
+
+        if (key_tok.str_data) free(key_tok.str_data);
     }
 
-    /* Now skip binary data until "EI" preceded by whitespace */
+    /* Now at the start of image data. Find "EI" to determine data extent. */
+    size_t data_start = p->pos;
+    size_t data_end = data_start;
+
+    /* Calculate expected data size for uncompressed image data */
+    size_t row_bits = 0;
+    if (is_image_mask) {
+        bpc = 1;
+        components = 1;
+    }
+    row_bits = (size_t)img_width * bpc * components;
+    size_t row_bytes = (row_bits + 7) / 8;
+    size_t expected_data = row_bytes * img_height;
+
+    /* Scan for "EI" to find end of data */
     while (!cs_at_end(p)) {
-        if (p->pos + 2 <= p->length) {
-            /* Look for whitespace followed by "EI" followed by whitespace/delimiter/EOF */
-            if (cs_is_whitespace(p->data[p->pos]) &&
-                p->pos + 2 < p->length &&
-                p->data[p->pos + 1] == 'E' &&
-                p->data[p->pos + 2] == 'I') {
-                /* Verify EI is followed by whitespace/delimiter/EOF */
-                if (p->pos + 3 >= p->length ||
-                    cs_is_whitespace(p->data[p->pos + 3]) ||
-                    cs_is_delimiter(p->data[p->pos + 3])) {
-                    p->pos += 3; /* skip whitespace + "EI" */
-                    return;
-                }
+        if (cs_is_whitespace(p->data[p->pos]) &&
+            p->pos + 2 < p->length &&
+            p->data[p->pos + 1] == 'E' &&
+            p->data[p->pos + 2] == 'I') {
+            if (p->pos + 3 >= p->length ||
+                cs_is_whitespace(p->data[p->pos + 3]) ||
+                cs_is_delimiter(p->data[p->pos + 3])) {
+                data_end = p->pos;
+                p->pos += 3; /* skip whitespace + "EI" */
+                break;
             }
         }
         p->pos++;
     }
+
+    /* Validate dimensions */
+    if (img_width <= 0 || img_height <= 0) return;
+    size_t data_len = data_end - data_start;
+    if (data_len < expected_data) return;
+
+    const uint8_t *img_data = p->data + data_start;
+
+    /* Create DIB section for the image */
+    BITMAPINFO bmi;
+    memset(&bmi, 0, sizeof(bmi));
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = img_width;
+    bmi.bmiHeader.biHeight      = -img_height; /* top-down */
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    uint8_t *dib_bits = NULL;
+    HBITMAP hbm = CreateDIBSection(ctx->hdc, &bmi, DIB_RGB_COLORS,
+                                    (void **)&dib_bits, NULL, 0);
+    if (!hbm || !dib_bits) {
+        if (hbm) DeleteObject(hbm);
+        return;
+    }
+
+    /* Get the fill color for image mask rendering */
+    PdfColor fill = current_gs(ctx)->fill_color;
+    uint8_t fr = (uint8_t)(fill.r * 255.0 + 0.5);
+    uint8_t fg = (uint8_t)(fill.g * 255.0 + 0.5);
+    uint8_t fb = (uint8_t)(fill.b * 255.0 + 0.5);
+
+    if (is_image_mask && bpc == 1) {
+        /* 1-bit image mask: render as stencil with current fill color.
+         * Bits are packed MSB-first. Each row is padded to byte boundary.
+         * Use a magic transparent color (RGB 255,0,255 magenta) for
+         * non-painted pixels, then use TransparentBlt to composite. */
+        uint8_t tr_r = 255, tr_g = 0, tr_b = 255; /* transparent color: magenta */
+        /* If fill color is magenta, use a different transparent color */
+        if (fr == 255 && fg == 0 && fb == 255) {
+            tr_r = 0; tr_g = 255; tr_b = 0; /* use green instead */
+        }
+
+        for (int py = 0; py < img_height; py++) {
+            const uint8_t *row = img_data + (size_t)py * row_bytes;
+            for (int px = 0; px < img_width; px++) {
+                int byte_idx = px / 8;
+                int bit_idx = 7 - (px % 8); /* MSB first */
+                int bit = (row[byte_idx] >> bit_idx) & 1;
+
+                /* Apply Decode array to determine paint/transparent:
+                 * The Decode array [D0 D1] maps: bit=0 -> D0, bit=1 -> D1.
+                 * A decoded value of 0 means PAINTED, 1 means TRANSPARENT.
+                 *
+                 * Default [0 1]: bit=0 -> 0 -> PAINTED, bit=1 -> 1 -> TRANSPARENT
+                 * Inverted [1 0]: bit=0 -> 1 -> TRANSPARENT, bit=1 -> 0 -> PAINTED */
+                bool painted;
+                if (decode_inverted) {
+                    painted = (bit == 1);
+                } else {
+                    painted = (bit == 0);
+                }
+
+                size_t dst_idx = ((size_t)py * img_width + px) * 4;
+                if (painted) {
+                    dib_bits[dst_idx + 0] = fb;   /* Blue */
+                    dib_bits[dst_idx + 1] = fg;   /* Green */
+                    dib_bits[dst_idx + 2] = fr;   /* Red */
+                    dib_bits[dst_idx + 3] = 255;
+                } else {
+                    dib_bits[dst_idx + 0] = tr_b; /* Blue */
+                    dib_bits[dst_idx + 1] = tr_g; /* Green */
+                    dib_bits[dst_idx + 2] = tr_r; /* Red */
+                    dib_bits[dst_idx + 3] = 255;
+                }
+            }
+        }
+
+        /* Blit with transparency: use TransparentBlt to skip transparent-color pixels */
+        PdfMatrix m = current_gs(ctx)->ctm;
+        double x0, y0, x1, y1, x2, y2, x3, y3;
+        pdf_transform_point(m, 0.0, 0.0, &x0, &y0);
+        pdf_transform_point(m, 1.0, 0.0, &x1, &y1);
+        pdf_transform_point(m, 1.0, 1.0, &x2, &y2);
+        pdf_transform_point(m, 0.0, 1.0, &x3, &y3);
+
+        double min_x = x0, max_x = x0, min_y = y0, max_y = y0;
+        if (x1 < min_x) min_x = x1; if (x1 > max_x) max_x = x1;
+        if (x2 < min_x) min_x = x2; if (x2 > max_x) max_x = x2;
+        if (x3 < min_x) min_x = x3; if (x3 > max_x) max_x = x3;
+        if (y1 < min_y) min_y = y1; if (y1 > max_y) max_y = y1;
+        if (y2 < min_y) min_y = y2; if (y2 > max_y) max_y = y2;
+        if (y3 < min_y) min_y = y3; if (y3 > max_y) max_y = y3;
+
+        int dest_x = (int)(min_x + 0.5);
+        int dest_y = (int)(min_y + 0.5);
+        int dest_w = (int)(max_x - min_x + 0.5);
+        int dest_h = (int)(max_y - min_y + 0.5);
+        if (dest_w < 1) dest_w = 1;
+        if (dest_h < 1) dest_h = 1;
+
+        HDC mem_dc = CreateCompatibleDC(ctx->hdc);
+        HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
+        SetStretchBltMode(ctx->hdc, COLORONCOLOR);
+        COLORREF trans_color = RGB(tr_r, tr_g, tr_b);
+        TransparentBlt(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
+                       mem_dc, 0, 0, img_width, img_height, trans_color);
+        SelectObject(mem_dc, old_bm);
+        DeleteDC(mem_dc);
+        DeleteObject(hbm);
+        return;
+    } else if (bpc == 8) {
+        /* Regular 8-bit inline image */
+        for (int py = 0; py < img_height; py++) {
+            for (int px = 0; px < img_width; px++) {
+                size_t src_idx = ((size_t)py * img_width + px) * components;
+                size_t dst_idx = ((size_t)py * img_width + px) * 4;
+                uint8_t r, g, b;
+
+                if (components == 1) {
+                    r = g = b = img_data[src_idx];
+                } else if (components == 3) {
+                    r = img_data[src_idx];
+                    g = img_data[src_idx + 1];
+                    b = img_data[src_idx + 2];
+                } else {
+                    r = g = b = 128;
+                }
+
+                dib_bits[dst_idx + 0] = b;
+                dib_bits[dst_idx + 1] = g;
+                dib_bits[dst_idx + 2] = r;
+                dib_bits[dst_idx + 3] = 255;
+            }
+        }
+    } else {
+        /* Unsupported BPC; just clean up */
+        DeleteObject(hbm);
+        return;
+    }
+
+    /* Blit to the DC using the current CTM */
+    blit_image_to_dc(ctx, hbm, img_width, img_height);
+    DeleteObject(hbm);
 }
 
 /*
@@ -2265,7 +2708,7 @@ static void interpret_stream(PdfRenderCtx *ctx, PdfDict *resources,
         /* ── Inline Image (BI/ID/EI) ── */
 
         else if (strcmp(op, "BI") == 0) {
-            skip_inline_image(&parser);
+            render_inline_image(ctx, &parser);
         }
 
         /* ── Marked Content (consume operands, no-op) ── */
@@ -2276,6 +2719,19 @@ static void interpret_stream(PdfRenderCtx *ctx, PdfDict *resources,
                  strcmp(op, "MP") == 0 ||
                  strcmp(op, "DP") == 0) {
             /* Ignore -- operands are consumed by clearing the stack below */
+        }
+
+        /* ── Type3 Glyph Operators ── */
+
+        else if (strcmp(op, "d0") == 0 && ops.count >= 2) {
+            /* Type3 glyph width: wx wy d0
+             * Sets the glyph width. We consume and ignore since we get
+             * widths from the /Widths array in the font dictionary. */
+        }
+        else if (strcmp(op, "d1") == 0 && ops.count >= 6) {
+            /* Type3 glyph width + bounding box: wx wy llx lly urx ury d1
+             * Sets the glyph width and bounding box. We consume and ignore
+             * since we get widths from /Widths and don't cache glyph bitmaps. */
         }
 
         /* ── Dictionary markers in content stream (inline image dict) ── */

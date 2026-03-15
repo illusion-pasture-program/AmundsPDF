@@ -1954,6 +1954,16 @@ ParsedFont *parsed_font_from_cff(const uint8_t *data, size_t len)
 bool parsed_font_get_glyph(ParsedFont *font, int char_code, GlyphOutline *outline)
 {
     if (!font || !outline) return false;
+
+    /* Dispatch to Type1 handler */
+    if (font->is_type1) {
+        glyph_outline_init(outline);
+        int gid = 0;
+        if (char_code >= 0 && char_code < 256)
+            gid = font->encoding[char_code];
+        return t1_get_glyph_by_gid(font, gid, outline);
+    }
+
     if (!font->is_cff) return false;  /* This file only handles CFF */
 
     glyph_outline_init(outline);
@@ -2015,6 +2025,11 @@ bool parsed_font_get_glyph(ParsedFont *font, int char_code, GlyphOutline *outlin
 bool parsed_font_get_glyph_by_gid(ParsedFont *font, int gid, GlyphOutline *outline)
 {
     if (!font || !outline) return false;
+
+    /* Dispatch to Type1 handler */
+    if (font->is_type1)
+        return t1_get_glyph_by_gid(font, gid, outline);
+
     if (!font->is_cff) return false;
 
     glyph_outline_init(outline);
@@ -2064,7 +2079,13 @@ bool parsed_font_get_glyph_by_gid(ParsedFont *font, int gid, GlyphOutline *outli
  */
 int parsed_font_find_gid_by_name(ParsedFont *font, const char *glyph_name)
 {
-    if (!font || !glyph_name || !font->is_cff) return -1;
+    if (!font || !glyph_name) return -1;
+
+    /* Dispatch to Type1 handler */
+    if (font->is_type1)
+        return t1_find_gid_by_name(font, glyph_name);
+
+    if (!font->is_cff) return -1;
     if (!font->charset_sids) return -1;
 
     size_t target_len = strlen(glyph_name);
@@ -2096,7 +2117,27 @@ int parsed_font_find_gid_by_name(ParsedFont *font, const char *glyph_name)
  */
 double parsed_font_get_advance(ParsedFont *font, int char_code)
 {
-    if (!font || !font->is_cff) return 0;
+    if (!font) return 0;
+
+    /* Dispatch to Type1 handler */
+    if (font->is_type1) {
+        int gid = 0;
+        if (char_code >= 0 && char_code < 256)
+            gid = font->encoding[char_code];
+        if (font->glyph_widths && gid >= 0 && gid < font->num_glyphs &&
+            font->glyph_widths[gid] != 0.0)
+            return font->glyph_widths[gid];
+        /* Parse glyph to get width */
+        GlyphOutline outline;
+        if (t1_get_glyph_by_gid(font, gid, &outline)) {
+            double w = outline.advance_width;
+            glyph_outline_free(&outline);
+            return w;
+        }
+        return 0;
+    }
+
+    if (!font->is_cff) return 0;
 
     /* Map char code to GID */
     int gid = 0;
@@ -2142,6 +2183,21 @@ void parsed_font_free(ParsedFont *font)
     if (font->owns_data && font->data) {
         free(font->data);
         font->data = NULL;
+    }
+
+    /* Type1-specific cleanup */
+    if (font->is_type1) {
+        free(font->t1_subrs_data);
+        free(font->t1_subrs_offs);
+        free(font->t1_subrs_lens);
+        free(font->t1_charstrings_data);
+        free(font->t1_charstrings_offs);
+        free(font->t1_charstrings_lens);
+        if (font->t1_glyph_names) {
+            for (int i = 0; i < font->t1_num_charstrings; i++)
+                free(font->t1_glyph_names[i]);
+            free(font->t1_glyph_names);
+        }
     }
 
     free(font);
