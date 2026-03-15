@@ -489,9 +489,10 @@ static COLORREF pdf_color_to_gdi(PdfColor c)
 static PdfColor cmyk_to_rgb(double c, double m, double y, double k)
 {
     PdfColor rgb;
-    rgb.r = 1.0 - (c + k);
-    rgb.g = 1.0 - (m + k);
-    rgb.b = 1.0 - (y + k);
+    /* Correct CMYK→RGB formula: R = (1-C)(1-K), not 1-(C+K) */
+    rgb.r = (1.0 - c) * (1.0 - k);
+    rgb.g = (1.0 - m) * (1.0 - k);
+    rgb.b = (1.0 - y) * (1.0 - k);
     if (rgb.r < 0.0) rgb.r = 0.0;
     if (rgb.r > 1.0) rgb.r = 1.0;
     if (rgb.g < 0.0) rgb.g = 0.0;
@@ -2380,9 +2381,9 @@ static int resolve_image_colorspace(PdfDocument *doc, PdfDict *dict,
                     double m_ = pal_data[pal_idx + 1] / 255.0;
                     double y_ = pal_data[pal_idx + 2] / 255.0;
                     double k_ = pal_data[pal_idx + 3] / 255.0;
-                    double rr = (1.0 - (c_ + k_));
-                    double gg = (1.0 - (m_ + k_));
-                    double bb = (1.0 - (y_ + k_));
+                    double rr = (1.0 - c_) * (1.0 - k_);
+                    double gg = (1.0 - m_) * (1.0 - k_);
+                    double bb = (1.0 - y_) * (1.0 - k_);
                     if (rr < 0.0) rr = 0.0; if (rr > 1.0) rr = 1.0;
                     if (gg < 0.0) gg = 0.0; if (gg > 1.0) gg = 1.0;
                     if (bb < 0.0) bb = 0.0; if (bb > 1.0) bb = 1.0;
@@ -3016,9 +3017,9 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
                 double m_ = src[src_idx + 1] / 255.0;
                 double y_ = src[src_idx + 2] / 255.0;
                 double k_ = src[src_idx + 3] / 255.0;
-                r = (uint8_t)((1.0 - (c_ + k_)) * 255.0);
-                g = (uint8_t)((1.0 - (m_ + k_)) * 255.0);
-                b = (uint8_t)((1.0 - (y_ + k_)) * 255.0);
+                r = (uint8_t)((1.0 - c_) * (1.0 - k_) * 255.0);
+                g = (uint8_t)((1.0 - m_) * (1.0 - k_) * 255.0);
+                b = (uint8_t)((1.0 - y_) * (1.0 - k_) * 255.0);
             } else {
                 r = g = b = 128;
             }
