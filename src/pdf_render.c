@@ -2418,6 +2418,41 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
         return;
     }
 
+    /* Check for ImageMask */
+    PdfObj *imask_obj = pdf_dict_get(dict, "ImageMask");
+    if (imask_obj && imask_obj->type == PDF_OBJ_REF)
+        imask_obj = pdf_resolve(ctx->doc, imask_obj);
+    bool is_image_mask = (imask_obj && imask_obj->type == PDF_OBJ_BOOL && imask_obj->boolean);
+
+    /* For ImageMask, BitsPerComponent is implicitly 1 */
+    if (is_image_mask) bpc = 1;
+
+    /* Check Decode array for inversion (relevant for 1-bit images) */
+    bool decode_inverted = false;
+    if (bpc == 1) {
+        PdfObj *decode_obj = pdf_dict_get(dict, "Decode");
+        if (decode_obj && decode_obj->type == PDF_OBJ_REF)
+            decode_obj = pdf_resolve(ctx->doc, decode_obj);
+        if (decode_obj && decode_obj->type == PDF_OBJ_ARRAY) {
+            PdfArray *darr = decode_obj->array;
+            if (darr->count >= 2) {
+                PdfObj *d0 = pdf_resolve(ctx->doc, darr->items[0]);
+                PdfObj *d1 = pdf_resolve(ctx->doc, darr->items[1]);
+                double v0 = 0.0, v1 = 1.0;
+                if (d0) {
+                    if (d0->type == PDF_OBJ_REAL) v0 = d0->real;
+                    else if (d0->type == PDF_OBJ_INT) v0 = (double)d0->integer;
+                }
+                if (d1) {
+                    if (d1->type == PDF_OBJ_REAL) v1 = d1->real;
+                    else if (d1->type == PDF_OBJ_INT) v1 = (double)d1->integer;
+                }
+                if (v0 == 1.0 && v1 == 0.0)
+                    decode_inverted = true;
+            }
+        }
+    }
+
     /* Resolve color space (handles Indexed, ICCBased, etc.) */
     bool is_indexed = false;
     uint8_t palette_rgb[256 * 3]; /* up to 256 RGB entries */
@@ -2426,7 +2461,10 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
                                               &is_indexed,
                                               palette_rgb, &palette_count);
 
-    /* Decode stream data (FlateDecode, etc.) */
+    /* For ImageMask, component count is 1 (it's a stencil, not color data) */
+    if (is_image_mask) components = 1;
+
+    /* Decode stream data (FlateDecode, CCITTFaxDecode, etc.) */
     if (!stream->decoded_data) {
         if (!pdf_decode_stream(ctx->doc, stream))
             return;
@@ -2436,7 +2474,116 @@ static void render_image(PdfRenderCtx *ctx, PdfObj *xobj)
     const uint8_t *src = stream->decoded_data;
     size_t src_len = stream->decoded_length;
 
-    /* Only handle 8-bit components for now */
+    /* --- Handle 1-bit images (ImageMask or regular 1-bpc grayscale) --- */
+    if (bpc == 1) {
+        size_t row_bytes = ((size_t)width + 7) / 8;
+        size_t expected_1bit = row_bytes * height;
+        if (src_len < expected_1bit) return;
+
+        /* Create a DIB section for the image */
+        BITMAPINFO bmi;
+        memset(&bmi, 0, sizeof(bmi));
+        bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth       = width;
+        bmi.bmiHeader.biHeight      = -height; /* top-down */
+        bmi.bmiHeader.biPlanes      = 1;
+        bmi.bmiHeader.biBitCount    = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+
+        uint8_t *dib_bits = NULL;
+        HBITMAP hbm = CreateDIBSection(ctx->hdc, &bmi, DIB_RGB_COLORS,
+                                        (void **)&dib_bits, NULL, 0);
+        if (!hbm || !dib_bits) {
+            if (hbm) DeleteObject(hbm);
+            return;
+        }
+
+        if (is_image_mask) {
+            /* ImageMask: render as stencil with current fill color.
+             * Painted pixels use fill color, transparent pixels use magenta key. */
+            PdfColor fill = current_gs(ctx)->fill_color;
+            uint8_t fr = (uint8_t)(fill.r * 255.0 + 0.5);
+            uint8_t fg = (uint8_t)(fill.g * 255.0 + 0.5);
+            uint8_t fb = (uint8_t)(fill.b * 255.0 + 0.5);
+
+            /* Choose a transparent key color that differs from fill */
+            uint8_t tr_r = 255, tr_g = 0, tr_b = 255; /* magenta */
+            if (fr == 255 && fg == 0 && fb == 255) {
+                tr_r = 0; tr_g = 255; tr_b = 0; /* green fallback */
+            }
+
+            for (int py = 0; py < height; py++) {
+                const uint8_t *row = src + (size_t)py * row_bytes;
+                for (int px = 0; px < width; px++) {
+                    int byte_idx = px / 8;
+                    int bit_idx = 7 - (px % 8); /* MSB first */
+                    int bit = (row[byte_idx] >> bit_idx) & 1;
+
+                    /* Default Decode [0 1]: bit 0 -> painted, bit 1 -> transparent
+                     * Inverted Decode [1 0]: bit 1 -> painted, bit 0 -> transparent */
+                    bool painted = decode_inverted ? (bit == 1) : (bit == 0);
+
+                    size_t dst_idx = ((size_t)py * width + px) * 4;
+                    if (painted) {
+                        dib_bits[dst_idx + 0] = fb;
+                        dib_bits[dst_idx + 1] = fg;
+                        dib_bits[dst_idx + 2] = fr;
+                        dib_bits[dst_idx + 3] = 255;
+                    } else {
+                        dib_bits[dst_idx + 0] = tr_b;
+                        dib_bits[dst_idx + 1] = tr_g;
+                        dib_bits[dst_idx + 2] = tr_r;
+                        dib_bits[dst_idx + 3] = 255;
+                    }
+                }
+            }
+
+            /* Blit with transparency using TransparentBlt */
+            int dest_x, dest_y, dest_w, dest_h;
+            compute_image_dest_rect(ctx, &dest_x, &dest_y, &dest_w, &dest_h);
+
+            HDC mem_dc = CreateCompatibleDC(ctx->hdc);
+            HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
+            SetStretchBltMode(ctx->hdc, COLORONCOLOR);
+            COLORREF trans_color = RGB(tr_r, tr_g, tr_b);
+            TransparentBlt(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
+                           mem_dc, 0, 0, width, height, trans_color);
+            SelectObject(mem_dc, old_bm);
+            DeleteDC(mem_dc);
+            DeleteObject(hbm);
+        } else {
+            /* Regular 1-bit grayscale image (not a mask).
+             * Default Decode [0 1]: bit 0 -> black (0), bit 1 -> white (255)
+             * Inverted Decode [1 0]: bit 0 -> white (255), bit 1 -> black (0) */
+            for (int py = 0; py < height; py++) {
+                const uint8_t *row = src + (size_t)py * row_bytes;
+                for (int px = 0; px < width; px++) {
+                    int byte_idx = px / 8;
+                    int bit_idx = 7 - (px % 8);
+                    int bit = (row[byte_idx] >> bit_idx) & 1;
+
+                    uint8_t gray;
+                    if (decode_inverted) {
+                        gray = (bit == 0) ? 255 : 0;
+                    } else {
+                        gray = (bit == 1) ? 255 : 0;
+                    }
+
+                    size_t dst_idx = ((size_t)py * width + px) * 4;
+                    dib_bits[dst_idx + 0] = gray; /* Blue */
+                    dib_bits[dst_idx + 1] = gray; /* Green */
+                    dib_bits[dst_idx + 2] = gray; /* Red */
+                    dib_bits[dst_idx + 3] = 255;
+                }
+            }
+
+            blit_image_to_dc(ctx, hbm, width, height);
+            DeleteObject(hbm);
+        }
+        return;
+    }
+
+    /* --- Handle 8-bit (and higher) images --- */
     if (bpc != 8) return;
 
     size_t expected = (size_t)width * height * components;
