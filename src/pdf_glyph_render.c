@@ -998,54 +998,6 @@ static int cid_to_gid(const CidFontInfo *info, int cid)
     return cid;
 }
 
-/* ─── Render a single glyph and advance the text matrix ─── */
-
-static void render_and_advance_glyph(PdfRenderCtx *ctx, ParsedFont *font,
-                                      double font_size, double h_scale,
-                                      COLORREF text_color, int gid,
-                                      double advance_width)
-{
-    PdfGraphicsState *gs = &ctx->gstate[ctx->gstate_depth];
-
-    /* Get glyph outline */
-    GlyphOutline outline;
-    glyph_outline_init(&outline);
-    bool got_glyph = parsed_font_get_glyph_by_gid(font, gid, &outline);
-
-    if (got_glyph && outline.count > 0 && gs->text_render_mode != 3) {
-        /* Compute combined matrix: text_matrix * CTM */
-        PdfMatrix combined = pdf_matrix_multiply(ctx->text_matrix, gs->ctm);
-
-        /* Apply text rise */
-        if (gs->text_rise != 0.0) {
-            PdfMatrix rise = PDF_IDENTITY_MATRIX;
-            rise.f = gs->text_rise;
-            combined = pdf_matrix_multiply(rise, combined);
-        }
-
-        render_glyph_outline(ctx->hdc, &outline, font, font_size,
-                              combined, text_color);
-    }
-
-    if (got_glyph) {
-        glyph_outline_free(&outline);
-
-        /* If glyph reported its own width, prefer that */
-        if (outline.advance_width != 0.0)
-            advance_width = outline.advance_width;
-    }
-
-    /* Advance text position */
-    double advance = (advance_width / (double)font->units_per_em) * font_size;
-
-    advance += gs->char_spacing;
-    advance *= h_scale;
-
-    PdfMatrix adv = PDF_IDENTITY_MATRIX;
-    adv.e = advance;
-    ctx->text_matrix = pdf_matrix_multiply(adv, ctx->text_matrix);
-}
-
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
 bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,

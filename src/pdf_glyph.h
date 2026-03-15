@@ -152,6 +152,9 @@ ParsedFont *parsed_font_from_type1(const uint8_t *data, size_t len);
 bool t1_get_glyph_by_gid(ParsedFont *font, int gid, GlyphOutline *outline);
 int  t1_find_gid_by_name(ParsedFont *font, const char *glyph_name);
 
+/* ─── TrueType glyph extraction (called from dispatch in pdf_glyph_cff.c) ─── */
+bool tt_get_glyph_by_gid(ParsedFont *font, int gid, GlyphOutline *outline);
+
 /*
  * Free a parsed font and all associated resources.
  */

@@ -1964,6 +1964,14 @@ bool parsed_font_get_glyph(ParsedFont *font, int char_code, GlyphOutline *outlin
         return t1_get_glyph_by_gid(font, gid, outline);
     }
 
+    /* Dispatch to TrueType handler */
+    if (!font->is_cff && font->glyf_table) {
+        int gid = 0;
+        if (char_code >= 0 && char_code < 256)
+            gid = font->encoding[char_code];
+        return tt_get_glyph_by_gid(font, gid, outline);
+    }
+
     if (!font->is_cff) return false;  /* This file only handles CFF */
 
     glyph_outline_init(outline);
@@ -2029,6 +2037,10 @@ bool parsed_font_get_glyph_by_gid(ParsedFont *font, int gid, GlyphOutline *outli
     /* Dispatch to Type1 handler */
     if (font->is_type1)
         return t1_get_glyph_by_gid(font, gid, outline);
+
+    /* Dispatch to TrueType handler */
+    if (!font->is_cff && font->glyf_table)
+        return tt_get_glyph_by_gid(font, gid, outline);
 
     if (!font->is_cff) return false;
 
@@ -2132,6 +2144,24 @@ double parsed_font_get_advance(ParsedFont *font, int char_code)
         if (t1_get_glyph_by_gid(font, gid, &outline)) {
             double w = outline.advance_width;
             glyph_outline_free(&outline);
+            return w;
+        }
+        return 0;
+    }
+
+    /* Dispatch to TrueType handler */
+    if (!font->is_cff && font->glyf_table) {
+        int gid = 0;
+        if (char_code >= 0 && char_code < 256)
+            gid = font->encoding[char_code];
+        if (font->glyph_widths && gid >= 0 && gid < font->num_glyphs &&
+            font->glyph_widths[gid] != 0.0)
+            return font->glyph_widths[gid];
+        /* Parse glyph to get width from hmtx */
+        if (font->hmtx_table && gid < font->num_h_metrics) {
+            double w = (double)((font->hmtx_table[gid * 4] << 8) | font->hmtx_table[gid * 4 + 1]);
+            if (font->glyph_widths && gid < font->num_glyphs)
+                font->glyph_widths[gid] = w;
             return w;
         }
         return 0;
