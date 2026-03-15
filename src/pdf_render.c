@@ -1843,9 +1843,6 @@ static void render_type3_string(PdfRenderCtx *ctx, PdfDict *resources,
                 pdf_decode_stream(ctx->doc, glyph_obj->stream);
 
             if (glyph_obj->stream->decoded_data) {
-                /* Save graphics state */
-                gs_save(ctx);
-
                 /* Build transformation: FontMatrix * font_size -> text space,
                  * then text_matrix * CTM -> device space.
                  *
@@ -1860,16 +1857,139 @@ static void render_type3_string(PdfRenderCtx *ctx, PdfDict *resources,
                 PdfMatrix glyph_to_device = pdf_matrix_multiply(
                     pdf_matrix_multiply(glyph_to_text, ctx->text_matrix), gs->ctm);
 
-                /* Set the CTM for glyph rendering */
-                current_gs(ctx)->ctm = glyph_to_device;
+                /* Compute glyph bounding box in device space.
+                 * Use FontBBox if available, otherwise use a generous estimate.
+                 * FontBBox is in glyph space coordinates. */
+                double bbox[4] = {0.0, 0.0, 1000.0, 1000.0}; /* default estimate */
+                PdfArray *font_bbox = pdf_dict_get_array(font_dict, "FontBBox");
+                if (font_bbox && pdf_array_len(font_bbox) >= 4) {
+                    for (int bi = 0; bi < 4; bi++) {
+                        PdfObj *bv = pdf_resolve(ctx->doc, pdf_array_get(font_bbox, bi));
+                        if (bv) {
+                            if (bv->type == PDF_OBJ_REAL) bbox[bi] = bv->real;
+                            else if (bv->type == PDF_OBJ_INT) bbox[bi] = (double)bv->integer;
+                        }
+                    }
+                }
 
-                /* Interpret the glyph content stream */
-                interpret_stream(ctx, font_resources,
-                                 glyph_obj->stream->decoded_data,
-                                 glyph_obj->stream->decoded_length);
+                /* Transform FontBBox corners through glyph_to_device */
+                double bx0, by0, bx1, by1, bx2, by2, bx3, by3;
+                pdf_transform_point(glyph_to_device, bbox[0], bbox[1], &bx0, &by0);
+                pdf_transform_point(glyph_to_device, bbox[2], bbox[1], &bx1, &by1);
+                pdf_transform_point(glyph_to_device, bbox[2], bbox[3], &bx2, &by2);
+                pdf_transform_point(glyph_to_device, bbox[0], bbox[3], &bx3, &by3);
 
-                /* Restore graphics state */
-                gs_restore(ctx);
+                double gmin_x = bx0, gmax_x = bx0, gmin_y = by0, gmax_y = by0;
+                if (bx1 < gmin_x) gmin_x = bx1; if (bx1 > gmax_x) gmax_x = bx1;
+                if (bx2 < gmin_x) gmin_x = bx2; if (bx2 > gmax_x) gmax_x = bx2;
+                if (bx3 < gmin_x) gmin_x = bx3; if (bx3 > gmax_x) gmax_x = bx3;
+                if (by1 < gmin_y) gmin_y = by1; if (by1 > gmax_y) gmax_y = by1;
+                if (by2 < gmin_y) gmin_y = by2; if (by2 > gmax_y) gmax_y = by2;
+                if (by3 < gmin_y) gmin_y = by3; if (by3 > gmax_y) gmax_y = by3;
+
+                int dest_x = (int)floor(gmin_x);
+                int dest_y = (int)floor(gmin_y);
+                int glyph_dev_w = (int)ceil(gmax_x) - dest_x;
+                int glyph_dev_h = (int)ceil(gmax_y) - dest_y;
+                if (glyph_dev_w < 1) glyph_dev_w = 1;
+                if (glyph_dev_h < 1) glyph_dev_h = 1;
+
+                /* Decide whether to supersample: only for small glyphs where
+                 * AA matters. Too large = waste memory, too small = not visible. */
+                int ss = 1; /* supersample factor */
+                if (glyph_dev_h >= 5 && glyph_dev_h <= 200 &&
+                    glyph_dev_w >= 3 && glyph_dev_w <= 200) {
+                    ss = 4;
+                }
+
+                if (ss > 1) {
+                    /* ── 4× Supersampled offscreen rendering ──
+                     * Render glyph at 4× device size into an offscreen buffer,
+                     * then downsample to the page with HALFTONE for smooth AA. */
+                    int off_w = glyph_dev_w * ss;
+                    int off_h = glyph_dev_h * ss;
+
+                    /* Create offscreen DIB section */
+                    BITMAPINFO off_bmi;
+                    memset(&off_bmi, 0, sizeof(off_bmi));
+                    off_bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+                    off_bmi.bmiHeader.biWidth       = off_w;
+                    off_bmi.bmiHeader.biHeight      = -off_h; /* top-down */
+                    off_bmi.bmiHeader.biPlanes      = 1;
+                    off_bmi.bmiHeader.biBitCount    = 32;
+                    off_bmi.bmiHeader.biCompression = BI_RGB;
+
+                    uint8_t *off_bits = NULL;
+                    HBITMAP off_bmp = CreateDIBSection(ctx->hdc, &off_bmi,
+                                                       DIB_RGB_COLORS,
+                                                       (void **)&off_bits, NULL, 0);
+                    if (off_bmp && off_bits) {
+                        HDC off_dc = CreateCompatibleDC(ctx->hdc);
+                        HBITMAP off_old = (HBITMAP)SelectObject(off_dc, off_bmp);
+
+                        /* Copy background from page DC into offscreen at 4× size.
+                         * This ensures transparency composites correctly against
+                         * whatever is already on the page. */
+                        SetStretchBltMode(off_dc, COLORONCOLOR);
+                        StretchBlt(off_dc, 0, 0, off_w, off_h,
+                                   ctx->hdc, dest_x, dest_y,
+                                   glyph_dev_w, glyph_dev_h, SRCCOPY);
+
+                        /* Save original HDC and swap in offscreen DC */
+                        HDC orig_hdc = ctx->hdc;
+                        ctx->hdc = off_dc;
+
+                        /* Save graphics state (will SaveDC on off_dc) */
+                        gs_save(ctx);
+
+                        /* Build adjusted CTM for offscreen rendering.
+                         * The glyph_to_device matrix maps glyph coords to page
+                         * device coords. We need to:
+                         * 1. Subtract the dest origin (translate to offscreen 0,0)
+                         * 2. Scale by ss (render at 4× size)
+                         *
+                         * new_ctm = glyph_to_device * translate(-dest_x, -dest_y) * scale(ss)
+                         */
+                        PdfMatrix to_offscreen = {
+                            (double)ss, 0.0,
+                            0.0, (double)ss,
+                            -(double)dest_x * ss, -(double)dest_y * ss
+                        };
+                        current_gs(ctx)->ctm = pdf_matrix_multiply(
+                            glyph_to_device, to_offscreen);
+
+                        /* Interpret the glyph content stream into offscreen */
+                        interpret_stream(ctx, font_resources,
+                                         glyph_obj->stream->decoded_data,
+                                         glyph_obj->stream->decoded_length);
+
+                        /* Restore graphics state (RestoreDC on off_dc) */
+                        gs_restore(ctx);
+
+                        /* Restore original page HDC */
+                        ctx->hdc = orig_hdc;
+
+                        /* Downsample offscreen → page with HALFTONE for AA */
+                        SetStretchBltMode(ctx->hdc, HALFTONE);
+                        SetBrushOrgEx(ctx->hdc, 0, 0, NULL);
+                        StretchBlt(ctx->hdc, dest_x, dest_y,
+                                   glyph_dev_w, glyph_dev_h,
+                                   off_dc, 0, 0, off_w, off_h, SRCCOPY);
+
+                        SelectObject(off_dc, off_old);
+                        DeleteDC(off_dc);
+                    }
+                    if (off_bmp) DeleteObject(off_bmp);
+                } else {
+                    /* No supersampling — render directly (too large or too small) */
+                    gs_save(ctx);
+                    current_gs(ctx)->ctm = glyph_to_device;
+                    interpret_stream(ctx, font_resources,
+                                     glyph_obj->stream->decoded_data,
+                                     glyph_obj->stream->decoded_length);
+                    gs_restore(ctx);
+                }
+
                 gs = current_gs(ctx); /* re-acquire after restore */
             }
         }
@@ -3379,11 +3499,13 @@ static void render_inline_image(PdfRenderCtx *ctx, CSParser *p)
         /* 1-bit image mask: render as stencil with current fill color.
          * Bits are packed MSB-first. Each row is padded to byte boundary.
          *
-         * We use premultiplied alpha + AlphaBlend for anti-aliased scaling:
-         * painted pixels get fill color with alpha=255, transparent pixels
-         * get RGBA(0,0,0,0). When AlphaBlend scales the image with HALFTONE
-         * mode, it interpolates the alpha channel, producing smooth edges
-         * instead of the jagged nearest-neighbor result from TransparentBlt. */
+         * Anti-aliasing for Type3 glyph bitmaps is now handled at the glyph
+         * level in render_type3_string() via 4x supersampled offscreen rendering.
+         * Here we just do a simple TransparentBlt — painted pixels get the fill
+         * color, transparent pixels use a sentinel color key for TransparentBlt. */
+
+        /* Use magenta (0xFF00FF) as the transparent color key */
+        COLORREF trans_color = RGB(255, 0, 255);
 
         for (int py = 0; py < img_height; py++) {
             const uint8_t *row = img_data + (size_t)py * row_bytes;
@@ -3393,11 +3515,8 @@ static void render_inline_image(PdfRenderCtx *ctx, CSParser *p)
                 int bit = (row[byte_idx] >> bit_idx) & 1;
 
                 /* Apply Decode array to determine paint/transparent:
-                 * The Decode array [D0 D1] maps: bit=0 -> D0, bit=1 -> D1.
-                 * A decoded value of 0 means PAINTED, 1 means TRANSPARENT.
-                 *
-                 * Default [0 1]: bit=0 -> 0 -> PAINTED, bit=1 -> 1 -> TRANSPARENT
-                 * Inverted [1 0]: bit=0 -> 1 -> TRANSPARENT, bit=1 -> 0 -> PAINTED */
+                 * Default [0 1]: bit=0 -> PAINTED, bit=1 -> TRANSPARENT
+                 * Inverted [1 0]: bit=0 -> TRANSPARENT, bit=1 -> PAINTED */
                 bool painted;
                 if (decode_inverted) {
                     painted = (bit == 1);
@@ -3407,130 +3526,32 @@ static void render_inline_image(PdfRenderCtx *ctx, CSParser *p)
 
                 size_t dst_idx = ((size_t)py * img_width + px) * 4;
                 if (painted) {
-                    /* Premultiplied alpha: color values are already at full
-                     * intensity since alpha=255, so no multiplication needed */
                     dib_bits[dst_idx + 0] = fb;   /* Blue */
                     dib_bits[dst_idx + 1] = fg;   /* Green */
                     dib_bits[dst_idx + 2] = fr;   /* Red */
-                    dib_bits[dst_idx + 3] = 255;  /* Fully opaque */
+                    dib_bits[dst_idx + 3] = 255;
                 } else {
-                    /* Fully transparent: all channels must be 0 for
-                     * premultiplied alpha (color * 0/255 = 0) */
-                    dib_bits[dst_idx + 0] = 0;
-                    dib_bits[dst_idx + 1] = 0;
-                    dib_bits[dst_idx + 2] = 0;
-                    dib_bits[dst_idx + 3] = 0;    /* Fully transparent */
+                    /* Transparent: use magenta color key */
+                    dib_bits[dst_idx + 0] = 255;  /* Blue */
+                    dib_bits[dst_idx + 1] = 0;    /* Green */
+                    dib_bits[dst_idx + 2] = 255;  /* Red */
+                    dib_bits[dst_idx + 3] = 255;
                 }
             }
         }
 
-        /* Blit with alpha blending for smooth anti-aliased scaling */
-        PdfMatrix m = current_gs(ctx)->ctm;
-        double x0, y0, x1, y1, x2, y2, x3, y3;
-        pdf_transform_point(m, 0.0, 0.0, &x0, &y0);
-        pdf_transform_point(m, 1.0, 0.0, &x1, &y1);
-        pdf_transform_point(m, 1.0, 1.0, &x2, &y2);
-        pdf_transform_point(m, 0.0, 1.0, &x3, &y3);
+        /* Blit with TransparentBlt — simple nearest-neighbor with transparency.
+         * The glyph-level supersampling in render_type3_string() handles AA. */
+        int dest_x, dest_y, dest_w, dest_h;
+        compute_image_dest_rect(ctx, &dest_x, &dest_y, &dest_w, &dest_h);
 
-        double min_x = x0, max_x = x0, min_y = y0, max_y = y0;
-        if (x1 < min_x) min_x = x1; if (x1 > max_x) max_x = x1;
-        if (x2 < min_x) min_x = x2; if (x2 > max_x) max_x = x2;
-        if (x3 < min_x) min_x = x3; if (x3 > max_x) max_x = x3;
-        if (y1 < min_y) min_y = y1; if (y1 > max_y) max_y = y1;
-        if (y2 < min_y) min_y = y2; if (y2 > max_y) max_y = y2;
-        if (y3 < min_y) min_y = y3; if (y3 > max_y) max_y = y3;
+        HDC mem_dc = CreateCompatibleDC(ctx->hdc);
+        HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
+        TransparentBlt(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
+                       mem_dc, 0, 0, img_width, img_height, trans_color);
+        SelectObject(mem_dc, old_bm);
+        DeleteDC(mem_dc);
 
-        int dest_x = (int)(min_x + 0.5);
-        int dest_y = (int)(min_y + 0.5);
-        int dest_w = (int)(max_x - min_x + 0.5);
-        int dest_h = (int)(max_y - min_y + 0.5);
-        if (dest_w < 1) dest_w = 1;
-        if (dest_h < 1) dest_h = 1;
-
-        /* Two-step supersampled anti-aliasing:
-         * 1. Scale the tiny 1-bit source (e.g., 9×14) up to 4× the FINAL
-         *    device size using nearest-neighbor. This preserves the crisp
-         *    pixel edges of the original bitmap at high resolution.
-         * 2. Downsample the 4× intermediate to the final size using HALFTONE
-         *    (bilinear). This averages the sharp edges into smooth AA.
-         *
-         * This is much sharper than directly interpolating the tiny source
-         * bitmap, which produces a blurry/fuzzy result. */
-        {
-            int ss_factor = 4; /* supersample factor */
-            int ss_w = dest_w * ss_factor;
-            int ss_h = dest_h * ss_factor;
-            if (ss_w < 1) ss_w = 1;
-            if (ss_h < 1) ss_h = 1;
-
-            /* Create 4× intermediate bitmap */
-            BITMAPINFO ss_bmi;
-            memset(&ss_bmi, 0, sizeof(ss_bmi));
-            ss_bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-            ss_bmi.bmiHeader.biWidth       = ss_w;
-            ss_bmi.bmiHeader.biHeight      = -ss_h;
-            ss_bmi.bmiHeader.biPlanes      = 1;
-            ss_bmi.bmiHeader.biBitCount    = 32;
-            ss_bmi.bmiHeader.biCompression = BI_RGB;
-
-            uint8_t *ss_bits = NULL;
-            HBITMAP ss_bmp = CreateDIBSection(ctx->hdc, &ss_bmi, DIB_RGB_COLORS,
-                                              (void **)&ss_bits, NULL, 0);
-            if (ss_bmp && ss_bits) {
-                HDC ss_dc = CreateCompatibleDC(ctx->hdc);
-                HBITMAP ss_old = (HBITMAP)SelectObject(ss_dc, ss_bmp);
-
-                /* Step 1: nearest-neighbor upscale source → 4× intermediate.
-                 * We do this manually (not via StretchBlt) to preserve the
-                 * premultiplied alpha data. StretchBlt ignores alpha and would
-                 * make black fill pixels indistinguishable from transparent. */
-                for (int py = 0; py < ss_h; py++) {
-                    int src_y = py * img_height / ss_h;
-                    if (src_y >= img_height) src_y = img_height - 1;
-                    for (int px = 0; px < ss_w; px++) {
-                        int src_x = px * img_width / ss_w;
-                        if (src_x >= img_width) src_x = img_width - 1;
-                        size_t src_idx = ((size_t)src_y * img_width + src_x) * 4;
-                        size_t dst_idx = ((size_t)py * ss_w + px) * 4;
-                        ss_bits[dst_idx + 0] = dib_bits[src_idx + 0];
-                        ss_bits[dst_idx + 1] = dib_bits[src_idx + 1];
-                        ss_bits[dst_idx + 2] = dib_bits[src_idx + 2];
-                        ss_bits[dst_idx + 3] = dib_bits[src_idx + 3];
-                    }
-                }
-
-                /* Step 2: HALFTONE downsample 4× → final size with alpha blend */
-                SetStretchBltMode(ctx->hdc, HALFTONE);
-                SetBrushOrgEx(ctx->hdc, 0, 0, NULL);
-
-                BLENDFUNCTION bf;
-                bf.BlendOp = AC_SRC_OVER;
-                bf.BlendFlags = 0;
-                bf.SourceConstantAlpha = 255;
-                bf.AlphaFormat = AC_SRC_ALPHA;
-
-                AlphaBlend(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
-                           ss_dc, 0, 0, ss_w, ss_h, bf);
-
-                SelectObject(ss_dc, ss_old);
-                DeleteDC(ss_dc);
-                DeleteObject(ss_bmp);
-            } else {
-                /* Fallback: direct AlphaBlend if supersample alloc fails */
-                HDC mem_dc = CreateCompatibleDC(ctx->hdc);
-                HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
-                SetStretchBltMode(ctx->hdc, HALFTONE);
-                BLENDFUNCTION bf;
-                bf.BlendOp = AC_SRC_OVER;
-                bf.BlendFlags = 0;
-                bf.SourceConstantAlpha = 255;
-                bf.AlphaFormat = AC_SRC_ALPHA;
-                AlphaBlend(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
-                           mem_dc, 0, 0, img_width, img_height, bf);
-                SelectObject(mem_dc, old_bm);
-                DeleteDC(mem_dc);
-            }
-        }
         DeleteObject(hbm);
         return;
     } else if (bpc == 8) {
