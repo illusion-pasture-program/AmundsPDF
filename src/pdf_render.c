@@ -3447,21 +3447,90 @@ static void render_inline_image(PdfRenderCtx *ctx, CSParser *p)
         if (dest_w < 1) dest_w = 1;
         if (dest_h < 1) dest_h = 1;
 
-        HDC mem_dc = CreateCompatibleDC(ctx->hdc);
-        HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
-        SetStretchBltMode(ctx->hdc, HALFTONE);
+        /* Two-step supersampled anti-aliasing:
+         * 1. Scale the tiny 1-bit source (e.g., 9×14) up to 4× the FINAL
+         *    device size using nearest-neighbor. This preserves the crisp
+         *    pixel edges of the original bitmap at high resolution.
+         * 2. Downsample the 4× intermediate to the final size using HALFTONE
+         *    (bilinear). This averages the sharp edges into smooth AA.
+         *
+         * This is much sharper than directly interpolating the tiny source
+         * bitmap, which produces a blurry/fuzzy result. */
+        {
+            int ss_factor = 4; /* supersample factor */
+            int ss_w = dest_w * ss_factor;
+            int ss_h = dest_h * ss_factor;
+            if (ss_w < 1) ss_w = 1;
+            if (ss_h < 1) ss_h = 1;
 
-        BLENDFUNCTION bf;
-        bf.BlendOp = AC_SRC_OVER;
-        bf.BlendFlags = 0;
-        bf.SourceConstantAlpha = 255;    /* use per-pixel alpha */
-        bf.AlphaFormat = AC_SRC_ALPHA;   /* source has premultiplied alpha */
+            /* Create 4× intermediate bitmap */
+            BITMAPINFO ss_bmi;
+            memset(&ss_bmi, 0, sizeof(ss_bmi));
+            ss_bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+            ss_bmi.bmiHeader.biWidth       = ss_w;
+            ss_bmi.bmiHeader.biHeight      = -ss_h;
+            ss_bmi.bmiHeader.biPlanes      = 1;
+            ss_bmi.bmiHeader.biBitCount    = 32;
+            ss_bmi.bmiHeader.biCompression = BI_RGB;
 
-        AlphaBlend(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
-                   mem_dc, 0, 0, img_width, img_height, bf);
+            uint8_t *ss_bits = NULL;
+            HBITMAP ss_bmp = CreateDIBSection(ctx->hdc, &ss_bmi, DIB_RGB_COLORS,
+                                              (void **)&ss_bits, NULL, 0);
+            if (ss_bmp && ss_bits) {
+                HDC ss_dc = CreateCompatibleDC(ctx->hdc);
+                HBITMAP ss_old = (HBITMAP)SelectObject(ss_dc, ss_bmp);
 
-        SelectObject(mem_dc, old_bm);
-        DeleteDC(mem_dc);
+                /* Step 1: nearest-neighbor upscale source → 4× intermediate.
+                 * We do this manually (not via StretchBlt) to preserve the
+                 * premultiplied alpha data. StretchBlt ignores alpha and would
+                 * make black fill pixels indistinguishable from transparent. */
+                for (int py = 0; py < ss_h; py++) {
+                    int src_y = py * img_height / ss_h;
+                    if (src_y >= img_height) src_y = img_height - 1;
+                    for (int px = 0; px < ss_w; px++) {
+                        int src_x = px * img_width / ss_w;
+                        if (src_x >= img_width) src_x = img_width - 1;
+                        size_t src_idx = ((size_t)src_y * img_width + src_x) * 4;
+                        size_t dst_idx = ((size_t)py * ss_w + px) * 4;
+                        ss_bits[dst_idx + 0] = dib_bits[src_idx + 0];
+                        ss_bits[dst_idx + 1] = dib_bits[src_idx + 1];
+                        ss_bits[dst_idx + 2] = dib_bits[src_idx + 2];
+                        ss_bits[dst_idx + 3] = dib_bits[src_idx + 3];
+                    }
+                }
+
+                /* Step 2: HALFTONE downsample 4× → final size with alpha blend */
+                SetStretchBltMode(ctx->hdc, HALFTONE);
+                SetBrushOrgEx(ctx->hdc, 0, 0, NULL);
+
+                BLENDFUNCTION bf;
+                bf.BlendOp = AC_SRC_OVER;
+                bf.BlendFlags = 0;
+                bf.SourceConstantAlpha = 255;
+                bf.AlphaFormat = AC_SRC_ALPHA;
+
+                AlphaBlend(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
+                           ss_dc, 0, 0, ss_w, ss_h, bf);
+
+                SelectObject(ss_dc, ss_old);
+                DeleteDC(ss_dc);
+                DeleteObject(ss_bmp);
+            } else {
+                /* Fallback: direct AlphaBlend if supersample alloc fails */
+                HDC mem_dc = CreateCompatibleDC(ctx->hdc);
+                HBITMAP old_bm = (HBITMAP)SelectObject(mem_dc, hbm);
+                SetStretchBltMode(ctx->hdc, HALFTONE);
+                BLENDFUNCTION bf;
+                bf.BlendOp = AC_SRC_OVER;
+                bf.BlendFlags = 0;
+                bf.SourceConstantAlpha = 255;
+                bf.AlphaFormat = AC_SRC_ALPHA;
+                AlphaBlend(ctx->hdc, dest_x, dest_y, dest_w, dest_h,
+                           mem_dc, 0, 0, img_width, img_height, bf);
+                SelectObject(mem_dc, old_bm);
+                DeleteDC(mem_dc);
+            }
+        }
         DeleteObject(hbm);
         return;
     } else if (bpc == 8) {
