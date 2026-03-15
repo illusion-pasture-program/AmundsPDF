@@ -530,9 +530,9 @@ static PdfColor cmyk_to_rgb(double c, double m, double y, double k)
      * R=(1-C)(1-K) ignores this, producing oversaturated colors (especially
      * blues). These coefficients approximate the SWOP ICC profile behavior
      * and match Adobe/MuPDF output within ~6 RGB units. */
-    double r_abs = 0.93 * c + 0.05 * m + 0.00 * y + k;
-    double g_abs = 0.13 * c + 0.83 * m + 0.05 * y + k;
-    double b_abs = 0.20 * c + 0.15 * m + 1.00 * y + k;
+    double r_abs = 0.91 * c + 0.03 * m + 0.00 * y + k;
+    double g_abs = 0.04 * c + 0.85 * m + 0.05 * y + k;
+    double b_abs = 0.21 * c + 0.10 * m + 0.84 * y + k;
     rgb.r = 1.0 - (r_abs < 1.0 ? r_abs : 1.0);
     rgb.g = 1.0 - (g_abs < 1.0 ? g_abs : 1.0);
     rgb.b = 1.0 - (b_abs < 1.0 ? b_abs : 1.0);
@@ -1485,11 +1485,12 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
     double prev_x = 0, prev_y = 0;
     double subpath_start_x = 0, subpath_start_y = 0;
 
-    /* Temporary arrays for left and right edge points */
-    double *left_x  = (double *)malloc(flat_count * sizeof(double));
-    double *left_y  = (double *)malloc(flat_count * sizeof(double));
-    double *right_x = (double *)malloc(flat_count * sizeof(double));
-    double *right_y = (double *)malloc(flat_count * sizeof(double));
+    /* Temporary arrays for left and right edge points.
+     * Allocate 2x to accommodate implicit closing segments for closed subpaths. */
+    double *left_x  = (double *)malloc(flat_count * 2 * sizeof(double));
+    double *left_y  = (double *)malloc(flat_count * 2 * sizeof(double));
+    double *right_x = (double *)malloc(flat_count * 2 * sizeof(double));
+    double *right_y = (double *)malloc(flat_count * 2 * sizeof(double));
     if (!left_x || !left_y || !right_x || !right_y) {
         free(left_x); free(left_y); free(right_x); free(right_y);
         free(flat_x); free(flat_y); free(flat_cmd);
@@ -1503,6 +1504,11 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
     /* Direction of first and last segments (for caps) */
     double first_dir_x = 0, first_dir_y = 0;
     double last_dir_x = 0, last_dir_y = 0;
+    /* Previous segment direction for miter join computation */
+    double prev_seg_ux = 0, prev_seg_uy = 0;
+    bool have_prev_seg = false;
+    /* First segment direction (for closed path miter at start) */
+    double first_seg_ux = 0, first_seg_uy = 0;
 
     for (int i = 0; i <= flat_count; i++) {
         bool is_end = (i >= flat_count);
@@ -1517,6 +1523,37 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
             /* Check if last point before flush was a close */
             if (i > 0 && i <= flat_count && flat_cmd[i-1] == 2) is_closed = true;
             bool is_open = !is_closed;
+
+            /* For closed subpaths, apply miter join between last and first segments.
+             * The last edge point (edge[s+n-1]) is at the subpath start position,
+             * and edge[s] is also at the subpath start. Both need mitering with
+             * the last segment's direction and the first segment's direction. */
+            if (is_closed && n >= 3) {
+                double mlimit = gs->miter_limit;
+                double cos_theta = last_dir_x * first_seg_ux + last_dir_y * first_seg_uy;
+                double denom = 1.0 + cos_theta;
+                if (denom > 1e-6) {
+                    double miter_ratio_sq = 2.0 / denom;
+                    if (miter_ratio_sq <= mlimit * mlimit) {
+                        /* Compute miter offset at subpath start/end junction */
+                        double n_last_x = -last_dir_y * half_w;
+                        double n_last_y =  last_dir_x * half_w;
+                        double n_first_x = -first_seg_uy * half_w;
+                        double n_first_y =  first_seg_ux * half_w;
+                        double mx = (n_last_x + n_first_x) / denom;
+                        double my = (n_last_y + n_first_y) / denom;
+                        /* Junction position (subpath start in raster-local coords) */
+                        double jx = subpath_start_x - bmin_x;
+                        double jy = subpath_start_y - bmin_y;
+                        /* Update first edge point */
+                        left_x[s]  = jx + mx; left_y[s]  = jy + my;
+                        right_x[s] = jx - mx; right_y[s] = jy - my;
+                        /* Update last edge point (same position) */
+                        left_x[s+n-1]  = jx + mx; left_y[s+n-1]  = jy + my;
+                        right_x[s+n-1] = jx - mx; right_y[s+n-1] = jy - my;
+                    }
+                }
+            }
 
             /* Start the polygon: begin at left edge of first point */
             if (is_open && gs->line_cap == 1 && n >= 1) {
@@ -1596,6 +1633,7 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
             raster_close(rctx);
 
             edge_count = subpath_edge_start;
+            have_prev_seg = false;
         }
 
         if (is_end) break;
@@ -1607,6 +1645,7 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
             subpath_start_y = prev_y;
             subpath_edge_start = edge_count;
             in_subpath = true;
+            have_prev_seg = false;
             continue;
         }
 
@@ -1621,22 +1660,49 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
         double seg_len = sqrt(dx * dx + dy * dy);
 
         if (seg_len > 1e-10) {
-            double nx = (-dy / seg_len) * half_w;
-            double ny = (dx / seg_len) * half_w;
+            double ux = dx / seg_len;
+            double uy = dy / seg_len;
+            double nx = -uy * half_w;
+            double ny = ux * half_w;
 
             if (edge_count == subpath_edge_start) {
                 /* First segment: store both start and end points */
                 left_x[edge_count]  = x0 + nx; left_y[edge_count]  = y0 + ny;
                 right_x[edge_count] = x0 - nx; right_y[edge_count] = y0 - ny;
-                first_dir_x = dx / seg_len;
-                first_dir_y = dy / seg_len;
+                first_dir_x = ux;
+                first_dir_y = uy;
+                first_seg_ux = ux;
+                first_seg_uy = uy;
                 edge_count++;
+            } else if (have_prev_seg) {
+                /* Junction between previous and current segment: apply miter join.
+                 * Update the previous endpoint (edge[edge_count-1]) which sits at
+                 * this junction point (x0, y0). */
+                double cos_theta = prev_seg_ux * ux + prev_seg_uy * uy;
+                double denom = 1.0 + cos_theta;
+                if (denom > 1e-6) {
+                    double miter_ratio_sq = 2.0 / denom;
+                    if (miter_ratio_sq <= gs->miter_limit * gs->miter_limit) {
+                        /* Compute miter offset */
+                        double pnx = -prev_seg_uy * half_w;
+                        double pny =  prev_seg_ux * half_w;
+                        double mx = (pnx + nx) / denom;
+                        double my = (pny + ny) / denom;
+                        left_x[edge_count-1]  = x0 + mx;
+                        left_y[edge_count-1]  = y0 + my;
+                        right_x[edge_count-1] = x0 - mx;
+                        right_y[edge_count-1] = y0 - my;
+                    }
+                }
             }
             /* Store end point of this segment */
             left_x[edge_count]  = x1 + nx; left_y[edge_count]  = y1 + ny;
             right_x[edge_count] = x1 - nx; right_y[edge_count] = y1 - ny;
-            last_dir_x = dx / seg_len;
-            last_dir_y = dy / seg_len;
+            last_dir_x = ux;
+            last_dir_y = uy;
+            prev_seg_ux = ux;
+            prev_seg_uy = uy;
+            have_prev_seg = true;
             edge_count++;
         }
 
@@ -2866,27 +2932,34 @@ static bool image_has_jpeg_filter(PdfDict *dict)
 static void compute_image_dest_rect(PdfRenderCtx *ctx,
                                       int *out_x, int *out_y, int *out_w, int *out_h)
 {
+    /* Transform the image unit square corners through the CTM.
+     * PDF images: (0,0)=bottom-left, (0,1)=top-left of image data.
+     * Image data is top-to-bottom, so in a top-down DIB, source row 0
+     * corresponds to unit-square point (x,1) and source row H corresponds
+     * to (x,0).  We need StretchBlt to map:
+     *   source (0,0) → device position of unit-square (0,1)  [first row]
+     *   source (W,H) → device position of unit-square (1,0)  [last row]
+     * If the CTM flips the image (common: image cm has d<0), we use
+     * negative dest_w/dest_h so StretchBlt mirrors correctly. */
     PdfMatrix m = current_gs(ctx)->ctm;
-    double x0, y0, x1, y1, x2, y2, x3, y3;
-    pdf_transform_point(m, 0.0, 0.0, &x0, &y0);
-    pdf_transform_point(m, 1.0, 0.0, &x1, &y1);
-    pdf_transform_point(m, 1.0, 1.0, &x2, &y2);
-    pdf_transform_point(m, 0.0, 1.0, &x3, &y3);
+    double x_tl, y_tl; /* top-left of image = unit (0,1) */
+    double x_tr, y_tr; /* top-right = unit (1,1) */
+    double x_bl, y_bl; /* bottom-left = unit (0,0) */
 
-    double min_x = x0, max_x = x0, min_y = y0, max_y = y0;
-    if (x1 < min_x) min_x = x1; if (x1 > max_x) max_x = x1;
-    if (x2 < min_x) min_x = x2; if (x2 > max_x) max_x = x2;
-    if (x3 < min_x) min_x = x3; if (x3 > max_x) max_x = x3;
-    if (y1 < min_y) min_y = y1; if (y1 > max_y) max_y = y1;
-    if (y2 < min_y) min_y = y2; if (y2 > max_y) max_y = y2;
-    if (y3 < min_y) min_y = y3; if (y3 > max_y) max_y = y3;
+    pdf_transform_point(m, 0.0, 1.0, &x_tl, &y_tl);
+    pdf_transform_point(m, 1.0, 1.0, &x_tr, &y_tr);
+    pdf_transform_point(m, 0.0, 0.0, &x_bl, &y_bl);
 
-    *out_x = (int)(min_x + 0.5);
-    *out_y = (int)(min_y + 0.5);
-    *out_w = (int)(max_x - min_x + 0.5);
-    *out_h = (int)(max_y - min_y + 0.5);
-    if (*out_w < 1) *out_w = 1;
-    if (*out_h < 1) *out_h = 1;
+    /* dest_x/y = where source (0,0) = image top-left goes.
+     * dest_w/h = signed size; negative values cause StretchBlt to mirror. */
+    *out_x = (int)(x_tl + 0.5);
+    *out_y = (int)(y_tl + 0.5);
+    *out_w = (int)(x_tr - x_tl + 0.5);
+    *out_h = (int)(y_bl - y_tl + 0.5);
+
+    /* Ensure non-zero dimensions */
+    if (*out_w == 0) *out_w = 1;
+    if (*out_h == 0) *out_h = 1;
 }
 
 static void blit_image_to_dc(PdfRenderCtx *ctx, HBITMAP hbm, int width, int height)

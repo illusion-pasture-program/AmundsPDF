@@ -156,6 +156,14 @@ int  t1_find_gid_by_name(ParsedFont *font, const char *glyph_name);
 bool tt_get_glyph_by_gid(ParsedFont *font, int gid, GlyphOutline *outline);
 
 /*
+ * Remap encoding[256] for a TrueType system font using Windows-1252 → Unicode
+ * → cmap lookup. Call this after parsed_font_from_truetype() on system fonts
+ * so that WinAnsiEncoding character codes (0x80-0x9F smart quotes, dashes, etc.)
+ * resolve to the correct glyphs.
+ */
+void tt_remap_encoding_win1252(ParsedFont *font);
+
+/*
  * Free a parsed font and all associated resources.
  */
 void parsed_font_free(ParsedFont *font);

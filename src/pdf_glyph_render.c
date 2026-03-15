@@ -52,6 +52,225 @@ static int cache_find_by_obj(int obj_num)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * System Font Cache
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * When a PDF references a non-embedded font, we load the corresponding
+ * system TrueType font via GDI's GetFontData() and parse it with our
+ * own TrueType parser. This gives us software-rasterized AA text for
+ * system fonts too, avoiding the inferior GDI TextOutW fallback.
+ */
+
+#define MAX_CACHED_SYSFONTS 32
+
+typedef struct {
+    char base_font_name[256];
+    ParsedFont *parsed;
+    bool tried;
+} CachedSysFont;
+
+static CachedSysFont g_sysfont_cache[MAX_CACHED_SYSFONTS];
+static int g_sysfont_cache_count = 0;
+
+/* Attempt to construct a "human-readable" Windows font name from a PDF
+ * BaseFont string by inserting spaces before transitions like lowercase→
+ * uppercase (e.g. "ArialNarrow" → "Arial Narrow"). Also strips common
+ * PDF suffixes like "MT", "PSMT", "PS-", and subset prefixes ("ABCDEF+").
+ * Returns the cleaned name in out_buf. */
+static void make_readable_fontname(const char *base_font, char *out_buf, int buf_size)
+{
+    if (!base_font || !base_font[0] || buf_size < 2) { out_buf[0] = '\0'; return; }
+
+    /* Skip subset prefix (e.g. "HYEEHK+") */
+    const char *src = base_font;
+    if (strlen(src) > 7 && src[6] == '+') {
+        bool all_upper = true;
+        for (int k = 0; k < 6; k++)
+            if (src[k] < 'A' || src[k] > 'Z') { all_upper = false; break; }
+        if (all_upper) src += 7;
+    }
+
+    /* Strip known suffixes: "PSMT", "PSMTBold", "-Roman", "MT" etc. */
+    char clean[256];
+    strncpy(clean, src, sizeof(clean) - 1);
+    clean[sizeof(clean) - 1] = '\0';
+
+    /* Remove trailing "PSMT" or "PS-*MT" */
+    char *psmt = strstr(clean, "PSMT");
+    if (psmt) *psmt = '\0';
+    char *ps_dash = strstr(clean, "PS-");
+    if (ps_dash) *ps_dash = '\0';
+    /* Remove trailing "MT" if present */
+    int clen = (int)strlen(clean);
+    if (clen > 2 && clean[clen-2] == 'M' && clean[clen-1] == 'T')
+        clean[clen-2] = '\0';
+
+    /* Insert spaces before uppercase letters that follow lowercase */
+    int j = 0;
+    for (int i = 0; clean[i] && j < buf_size - 2; i++) {
+        if (i > 0 && clean[i] >= 'A' && clean[i] <= 'Z' &&
+            clean[i-1] >= 'a' && clean[i-1] <= 'z') {
+            out_buf[j++] = ' ';
+        }
+        /* Also convert '-' to ' ' */
+        out_buf[j++] = (clean[i] == '-') ? ' ' : clean[i];
+    }
+    out_buf[j] = '\0';
+}
+
+/* Load a system TrueType font by extracting its raw data via GDI,
+ * then parsing it with our TrueType glyph parser.
+ * Strategy: first try the "readable" font name (e.g. "Arial Narrow"),
+ * then fall back to heuristic family classification. */
+static HFONT create_system_font_handle(const char *base_font,
+                                         char *out_family, int family_size)
+{
+    int weight = FW_NORMAL;
+    BYTE italic = FALSE;
+
+    /* Detect weight/style from the base font name */
+    if (strstr(base_font, "Bold") || strstr(base_font, "bold") ||
+        strstr(base_font, "-Bd") || strstr(base_font, "Demi"))
+        weight = FW_BOLD;
+    if (strstr(base_font, "Italic") || strstr(base_font, "italic") ||
+        strstr(base_font, "Oblique") || strstr(base_font, "oblique"))
+        italic = TRUE;
+
+    /* Try 1: construct a readable name and ask GDI for it directly */
+    char readable[256];
+    make_readable_fontname(base_font, readable, sizeof(readable));
+
+    /* Strip style words from readable name so we get the pure family */
+    char family_try[256];
+    strncpy(family_try, readable, sizeof(family_try) - 1);
+    family_try[sizeof(family_try) - 1] = '\0';
+    /* Remove " Bold", " Italic", " BoldItalic" from end of family name */
+    char *bp = strstr(family_try, " Bold");
+    if (bp) *bp = '\0';
+    bp = strstr(family_try, " Italic");
+    if (bp) *bp = '\0';
+
+    LOGFONTW lf;
+    memset(&lf, 0, sizeof(lf));
+    lf.lfHeight = -100;
+    lf.lfWeight = weight;
+    lf.lfItalic = italic;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    lf.lfOutPrecision = OUT_TT_PRECIS;
+    lf.lfQuality = ANTIALIASED_QUALITY;
+
+    if (family_try[0]) {
+        MultiByteToWideChar(CP_ACP, 0, family_try, -1, lf.lfFaceName, LF_FACESIZE);
+        HFONT hfont = CreateFontIndirectW(&lf);
+        if (hfont) {
+            /* Verify GDI actually gave us a TrueType font with data */
+            HDC hdc = CreateCompatibleDC(NULL);
+            SelectObject(hdc, hfont);
+            DWORD sz = GetFontData(hdc, 0, 0, NULL, 0);
+            DeleteDC(hdc);
+            if (sz != GDI_ERROR && sz > 0) {
+                strncpy(out_family, family_try, family_size - 1);
+                return hfont;
+            }
+            DeleteObject(hfont);
+        }
+    }
+
+    /* Try 2: heuristic classification */
+    const char *win_family = "Arial";
+    if (strstr(base_font, "Times") || strstr(base_font, "times") ||
+        strstr(base_font, "Serif") || strstr(base_font, "serif"))
+        win_family = "Times New Roman";
+    else if (strstr(base_font, "Courier") || strstr(base_font, "courier") ||
+             strstr(base_font, "Mono") || strstr(base_font, "mono"))
+        win_family = "Courier New";
+    else if (strstr(base_font, "Symbol") || strstr(base_font, "symbol"))
+        win_family = "Symbol";
+
+    MultiByteToWideChar(CP_ACP, 0, win_family, -1, lf.lfFaceName, LF_FACESIZE);
+    strncpy(out_family, win_family, family_size - 1);
+    return CreateFontIndirectW(&lf);
+}
+
+/* Load a system TrueType font by extracting its raw data via GDI,
+ * then parsing it with our TrueType glyph parser. Returns NULL on failure. */
+static ParsedFont *load_system_font(const char *base_font)
+{
+    if (!base_font || !base_font[0]) return NULL;
+
+    /* Check cache first */
+    for (int i = 0; i < g_sysfont_cache_count; i++) {
+        if (strcmp(g_sysfont_cache[i].base_font_name, base_font) == 0) {
+            return g_sysfont_cache[i].parsed; /* may be NULL if load failed */
+        }
+    }
+
+    /* Allocate cache slot */
+    if (g_sysfont_cache_count >= MAX_CACHED_SYSFONTS)
+        return NULL;
+    CachedSysFont *entry = &g_sysfont_cache[g_sysfont_cache_count++];
+    memset(entry, 0, sizeof(*entry));
+    strncpy(entry->base_font_name, base_font, sizeof(entry->base_font_name) - 1);
+    entry->tried = true;
+
+    /* Create a GDI font handle — tries the "readable" name first (e.g.
+     * "ArialNarrow" → "Arial Narrow"), then falls back to heuristic match. */
+    char win_family[256] = "";
+    HFONT hfont = create_system_font_handle(base_font, win_family, sizeof(win_family));
+    if (!hfont) return NULL;
+
+    HDC hdc = CreateCompatibleDC(NULL);
+    HFONT old_font = (HFONT)SelectObject(hdc, hfont);
+
+    /* Get the raw TrueType font data */
+    DWORD data_size = GetFontData(hdc, 0, 0, NULL, 0);
+    if (data_size == GDI_ERROR || data_size == 0) {
+        SelectObject(hdc, old_font);
+        DeleteDC(hdc);
+        DeleteObject(hfont);
+        return NULL;
+    }
+
+    uint8_t *data = (uint8_t *)malloc(data_size);
+    if (!data) {
+        SelectObject(hdc, old_font);
+        DeleteDC(hdc);
+        DeleteObject(hfont);
+        return NULL;
+    }
+
+    if (GetFontData(hdc, 0, 0, data, data_size) == GDI_ERROR) {
+        free(data);
+        SelectObject(hdc, old_font);
+        DeleteDC(hdc);
+        DeleteObject(hfont);
+        return NULL;
+    }
+
+    SelectObject(hdc, old_font);
+    DeleteDC(hdc);
+    DeleteObject(hfont);
+
+    /* Parse as TrueType */
+    ParsedFont *parsed = parsed_font_from_truetype(data, data_size);
+    if (parsed) {
+        parsed->owns_data = true; /* we malloc'd the data, ParsedFont must free it */
+        /* Remap encoding from Unicode to Windows-1252 so that PDF character
+         * codes (which use WinAnsiEncoding) map to the correct glyphs.
+         * Without this, smart quotes (0x91-0x94), em dashes (0x97), etc.
+         * render as missing glyphs. */
+        tt_remap_encoding_win1252(parsed);
+        fprintf(stderr, "[GLYPH] Loaded system font '%s' -> '%s' glyphs=%d upem=%d\n",
+                base_font, win_family, parsed->num_glyphs, parsed->units_per_em);
+    } else {
+        free(data);
+    }
+
+    entry->parsed = parsed;
+    return parsed;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * Font Stream Extraction
  * ═══════════════════════════════════════════════════════════════════════════
  *
@@ -1025,8 +1244,23 @@ bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
 
     /* Try to extract/parse the embedded font */
     ParsedFont *font = extract_embedded_font(ctx->doc, resources, gs->font_name);
-    if (!font)
-        return false; /* no embedded font, caller should fall back to TextOutW */
+    if (!font) {
+        /* No embedded font. Try loading the corresponding system TrueType font
+         * and rendering through our software rasterizer instead of GDI TextOutW. */
+        PdfObj *fonts_obj = pdf_dict_get(resources, "Font");
+        if (fonts_obj) fonts_obj = pdf_resolve(ctx->doc, fonts_obj);
+        const char *base_font = NULL;
+        if (fonts_obj && fonts_obj->type == PDF_OBJ_DICT) {
+            PdfObj *fobj = pdf_dict_get(fonts_obj->dict, gs->font_name);
+            if (fobj) fobj = pdf_resolve(ctx->doc, fobj);
+            if (fobj && fobj->type == PDF_OBJ_DICT)
+                base_font = pdf_dict_get_name(fobj->dict, "BaseFont");
+        }
+        if (base_font)
+            font = load_system_font(base_font);
+        if (!font)
+            return false; /* truly no font available, fall back to GDI */
+    }
 
     double font_size = gs->font_size;
     if (font_size == 0.0)

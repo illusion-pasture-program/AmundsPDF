@@ -61,6 +61,62 @@ static bool tt_find_table(const uint8_t *data, size_t len, const char *tag, TtTa
 
 /* Find a Unicode cmap subtable (format 4 preferred) and build encoding[256].
  * This maps character codes 0-255 to GIDs for simple font usage. */
+/* Windows-1252 → Unicode mapping for the 0x80-0x9F range.
+ * All other codes (0x00-0x7F, 0xA0-0xFF) map directly to the same Unicode value. */
+static const uint16_t g_win1252_to_unicode[32] = {
+    0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,  /* 80-87 */
+    0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,  /* 88-8F */
+    0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,  /* 90-97 */
+    0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,  /* 98-9F */
+};
+
+static uint16_t win1252_to_unicode(int code)
+{
+    if (code >= 0x80 && code <= 0x9F)
+        return g_win1252_to_unicode[code - 0x80];
+    return (uint16_t)code;
+}
+
+/* Look up a Unicode code point in a cmap format 4 subtable.
+ * Returns the glyph index, or 0 (notdef) if not found. */
+static int tt_cmap4_lookup(const uint8_t *subtable, const uint8_t *cmap_end,
+                            uint16_t unicode_cp)
+{
+    if (subtable + 14 > cmap_end) return 0;
+
+    uint16_t seg_count_x2 = tt_u16(subtable + 6);
+    uint16_t seg_count = seg_count_x2 / 2;
+
+    const uint8_t *end_codes = subtable + 14;
+    const uint8_t *start_codes = end_codes + seg_count_x2 + 2;
+    const uint8_t *id_deltas = start_codes + seg_count_x2;
+    const uint8_t *id_range_offsets = id_deltas + seg_count_x2;
+
+    for (int seg = 0; seg < seg_count; seg++) {
+        uint16_t end_code = tt_u16(end_codes + seg * 2);
+        uint16_t start_code = tt_u16(start_codes + seg * 2);
+
+        if (unicode_cp < start_code || unicode_cp > end_code) continue;
+
+        uint16_t range_offset = tt_u16(id_range_offsets + seg * 2);
+        int16_t delta = tt_s16(id_deltas + seg * 2);
+
+        int gid;
+        if (range_offset == 0) {
+            gid = (unicode_cp + delta) & 0xFFFF;
+        } else {
+            const uint8_t *glyph_addr = id_range_offsets + seg * 2 + range_offset +
+                                         (unicode_cp - start_code) * 2;
+            if (glyph_addr + 1 >= cmap_end) return 0;
+            gid = tt_u16(glyph_addr);
+            if (gid != 0)
+                gid = (gid + delta) & 0xFFFF;
+        }
+        return gid;
+    }
+    return 0;
+}
+
 static void tt_parse_cmap(const uint8_t *font_data, size_t font_len, ParsedFont *font)
 {
     TtTable cmap_tbl;
@@ -603,6 +659,50 @@ bool tt_get_glyph_by_gid(ParsedFont *font, int gid, GlyphOutline *outline)
         font->glyph_widths[gid] = advance;
 
     return true;
+}
+
+/* ─── Remap encoding for system fonts using Windows-1252 ─── */
+
+void tt_remap_encoding_win1252(ParsedFont *font)
+{
+    if (!font || !font->cmap_table || font->cmap_len < 4) return;
+
+    /* Find the best cmap subtable (same logic as tt_parse_cmap) */
+    uint16_t num_subtables = tt_u16(font->cmap_table + 2);
+    const uint8_t *best_subtable = NULL;
+    int best_priority = -1;
+
+    for (int i = 0; i < num_subtables; i++) {
+        const uint8_t *rec = font->cmap_table + 4 + i * 8;
+        if ((size_t)(4 + (i + 1) * 8) > font->cmap_len) break;
+
+        uint16_t platform = tt_u16(rec);
+        uint16_t encoding = tt_u16(rec + 2);
+        uint32_t offset = tt_u32(rec + 4);
+
+        int priority = -1;
+        if (platform == 3 && encoding == 1) priority = 10;
+        else if (platform == 0) priority = 5;
+
+        if (priority > best_priority && offset < font->cmap_len) {
+            best_subtable = font->cmap_table + offset;
+            best_priority = priority;
+        }
+    }
+
+    if (!best_subtable) return;
+    uint16_t format = tt_u16(best_subtable);
+    if (format != 4) return; /* only handle format 4 for now */
+
+    const uint8_t *cmap_end = font->cmap_table + font->cmap_len;
+
+    /* Rebuild encoding[256] using Windows-1252 → Unicode → cmap lookup */
+    for (int code = 0; code < 256; code++) {
+        uint16_t unicode_cp = win1252_to_unicode(code);
+        int gid = tt_cmap4_lookup(best_subtable, cmap_end, unicode_cp);
+        if (gid > 0 && gid < font->num_glyphs)
+            font->encoding[code] = gid;
+    }
 }
 
 /* ─── Public: parse TrueType font ─── */
