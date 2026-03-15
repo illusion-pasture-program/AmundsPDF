@@ -523,11 +523,43 @@ static void raster_finish_internal(RasterCtx *ctx, int fill_rule)
     int height = ctx->height;
     int total_sub = height * SUBSAMPLE_Y;
 
-    /* Sort all edges by y_top for efficient sweep-line processing */
-    qsort(ctx->edges, ctx->edge_count, sizeof(Edge), edge_compare);
+    /* Sort all edges by y_top for efficient sweep-line processing.
+     * For small edge counts, insertion sort avoids qsort's function-call overhead. */
+    if (ctx->edge_count < 32) {
+        /* Insertion sort for small arrays */
+        for (int i = 1; i < ctx->edge_count; i++) {
+            Edge key = ctx->edges[i];
+            int j = i - 1;
+            while (j >= 0 && edge_compare(&ctx->edges[j], &key) > 0) {
+                ctx->edges[j + 1] = ctx->edges[j];
+                j--;
+            }
+            ctx->edges[j + 1] = key;
+        }
+    } else {
+        qsort(ctx->edges, ctx->edge_count, sizeof(Edge), edge_compare);
+    }
 
     /* Clear coverage buffer */
     memset(ctx->coverage, 0, (size_t)width * height);
+
+    /* Compute the actual sub-scanline range from edge bounds.
+     * Edges are sorted by y_top, so min is edges[0].y_top.
+     * We scan all edges to find the maximum y_bottom. */
+    int sub_y_min = ctx->edges[0].y_top;
+    int sub_y_max = 0;
+    for (int i = 0; i < ctx->edge_count; i++) {
+        if (ctx->edges[i].y_bottom > sub_y_max)
+            sub_y_max = ctx->edges[i].y_bottom;
+    }
+    /* Clamp to valid range */
+    if (sub_y_min < 0) sub_y_min = 0;
+    if (sub_y_max > total_sub) sub_y_max = total_sub;
+    /* Align sub_y_min down to pixel row boundary so row_counts logic works */
+    sub_y_min = (sub_y_min / SUBSAMPLE_Y) * SUBSAMPLE_Y;
+    /* Align sub_y_max up to pixel row boundary so the last row gets written */
+    sub_y_max = ((sub_y_max + SUBSAMPLE_Y - 1) / SUBSAMPLE_Y) * SUBSAMPLE_Y;
+    if (sub_y_max > total_sub) sub_y_max = total_sub;
 
     /* We accumulate sub-scanline hit counts per pixel row.
      * For each pixel row, we process SUBSAMPLE_Y sub-scanlines and count
@@ -538,13 +570,27 @@ static void raster_finish_internal(RasterCtx *ctx, int fill_rule)
     ctx->ael_count = 0;
     int edge_idx = 0; /* index into sorted edge array: next edge to activate */
 
-    for (int sub_y = 0; sub_y < total_sub; sub_y++) {
+    /* Skip edges before sub_y_min (there shouldn't be any since edges are sorted,
+     * but advance edge_idx to be safe) */
+    while (edge_idx < ctx->edge_count && ctx->edges[edge_idx].y_top < sub_y_min) {
+        edge_idx++;
+    }
+
+    /* Track the range of touched pixels per row to avoid scanning entire width */
+    int row_px_min = width, row_px_max = 0;
+
+    for (int sub_y = sub_y_min; sub_y < sub_y_max; sub_y++) {
         int pixel_row = sub_y / SUBSAMPLE_Y;
         int sub_offset = sub_y % SUBSAMPLE_Y;
 
-        /* At the start of each pixel row, clear the per-pixel counters */
+        /* At the start of each pixel row, clear the per-pixel counters.
+         * Only clear the range that was actually touched in the previous row. */
         if (sub_offset == 0) {
-            memset(row_counts, 0, width * sizeof(int));
+            if (row_px_min <= row_px_max) {
+                memset(row_counts + row_px_min, 0, (row_px_max - row_px_min + 1) * sizeof(int));
+            }
+            row_px_min = width;
+            row_px_max = 0;
         }
 
         /* Remove edges that have ended */
@@ -556,6 +602,33 @@ static void raster_finish_internal(RasterCtx *ctx, int fill_rule)
                 ael_insert(ctx, &ctx->edges[edge_idx], sub_y);
             }
             edge_idx++;
+        }
+
+        /* If no active edges, skip the expensive crossing/winding work.
+         * Also try to skip ahead: if the next edge doesn't start until a
+         * later sub-scanline, jump forward (but stay within the current
+         * pixel row to ensure coverage is written correctly). */
+        if (ctx->ael_count == 0) {
+            /* Find how far we can skip: to the next edge start or end of pixel row */
+            int next_edge_start = sub_y_max;  /* default: skip to end */
+            if (edge_idx < ctx->edge_count)
+                next_edge_start = ctx->edges[edge_idx].y_top;
+
+            /* End of current pixel row (the last sub-scanline that writes coverage) */
+            int row_end = (pixel_row + 1) * SUBSAMPLE_Y - 1;
+
+            if (next_edge_start > row_end + 1 && sub_y < row_end) {
+                /* No edges start in this pixel row. Skip to the coverage-write
+                 * sub-scanline (row_end). row_counts is already zero, so coverage
+                 * for this row will be zero which is correct. */
+                sub_y = row_end;
+                sub_offset = SUBSAMPLE_Y - 1;
+                /* Don't call ael_advance since AEL is empty */
+                goto write_coverage;
+            }
+
+            /* No edges active on this sub-scanline; skip crossing work */
+            goto advance_and_coverage;
         }
 
         /* Collect crossings from active edges */
@@ -611,29 +684,53 @@ static void raster_finish_internal(RasterCtx *ctx, int fill_rule)
                 if (px_start < 0) px_start = 0;
                 if (px_end > width) px_end = width;
 
-                for (int px = px_start; px < px_end; px++) {
-                    /* Compute fractional coverage for this pixel on this sub-scanline.
-                     * The pixel covers x in [px, px+1).
-                     * The span covers x in [x_start, x_end).
-                     * The overlap is the intersection. We scale to 256ths. */
-                    double left  = (px > x_start) ? (double)px : x_start;
-                    double right = ((px + 1) < x_end) ? (double)(px + 1) : x_end;
-                    double frac  = right - left; /* 0.0 to 1.0 */
+                /* Track touched pixel range for efficient clear/write */
+                if (px_start < row_px_min) row_px_min = px_start;
+                if (px_end > row_px_max) row_px_max = px_end - 1;
 
-                    /* Accumulate fractional coverage scaled to 256.
-                     * Each sub-scanline contributes up to 256/SUBSAMPLE_Y = 32. */
-                    row_counts[px] += (int)(frac * 256.0 + 0.5);
+                /* Fractional coverage for edge pixels, full coverage for middle.
+                 * Edge pixels (first and last in span) need the overlap calculation.
+                 * Middle pixels are fully covered: overlap is exactly 1.0 = 256. */
+                if (px_end - px_start <= 2) {
+                    /* Narrow span (1-2 pixels): always compute fractional coverage */
+                    for (int px = px_start; px < px_end; px++) {
+                        double left  = (px > x_start) ? (double)px : x_start;
+                        double right = ((px + 1) < x_end) ? (double)(px + 1) : x_end;
+                        double frac  = right - left;
+                        row_counts[px] += (int)(frac * 256.0 + 0.5);
+                    }
+                } else {
+                    /* First pixel: fractional left edge */
+                    {
+                        double left  = (px_start > x_start) ? (double)px_start : x_start;
+                        double frac  = (double)(px_start + 1) - left;
+                        row_counts[px_start] += (int)(frac * 256.0 + 0.5);
+                    }
+                    /* Middle pixels: full coverage (256 per sub-scanline) */
+                    for (int px = px_start + 1; px < px_end - 1; px++) {
+                        row_counts[px] += 256;
+                    }
+                    /* Last pixel: fractional right edge */
+                    {
+                        double right = ((px_end) < x_end) ? (double)(px_end) : x_end;
+                        double frac  = right - (double)(px_end - 1);
+                        row_counts[px_end - 1] += (int)(frac * 256.0 + 0.5);
+                    }
                 }
             }
         }
 
+advance_and_coverage:
         /* Advance all active edges for the next sub-scanline */
         ael_advance(ctx);
 
-        /* At the end of each pixel row (last sub-scanline), write coverage */
-        if (sub_offset == SUBSAMPLE_Y - 1) {
+write_coverage:
+
+        /* At the end of each pixel row (last sub-scanline), write coverage.
+         * Only write the range of pixels that were actually touched. */
+        if (sub_offset == SUBSAMPLE_Y - 1 && row_px_min <= row_px_max) {
             uint8_t *row = ctx->coverage + (size_t)pixel_row * width;
-            for (int px = 0; px < width; px++) {
+            for (int px = row_px_min; px <= row_px_max; px++) {
                 /* row_counts[px] is the sum of fractional coverage * 256
                  * across SUBSAMPLE_Y sub-scanlines. Divide by SUBSAMPLE_Y
                  * to get the final coverage in 0..255.
