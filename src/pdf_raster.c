@@ -33,13 +33,15 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /* Number of vertical sub-scanlines per pixel row for anti-aliasing.
- * 8 gives good quality for text rendering (8 levels of vertical AA). */
-#define SUBSAMPLE_Y     8
+ * 16 gives high quality for text and path rendering (16 levels of vertical AA).
+ * Higher values give smoother edges at the cost of more scanline processing. */
+#define SUBSAMPLE_Y     16
 
 /* Flatness threshold for bezier subdivision (in pixels squared).
- * Smaller = more accurate curves but more edges. 0.25 px is quarter-pixel
- * accuracy, which is imperceptible. We compare distance-squared to avoid sqrt. */
-#define FLATNESS_SQ     (0.25 * 0.25)
+ * Smaller = more accurate curves but more edges. 0.1 px gives sub-pixel
+ * accuracy for high-quality curve rendering. We compare distance-squared
+ * to avoid sqrt. */
+#define FLATNESS_SQ     (0.1 * 0.1)
 
 /* Maximum recursion depth for bezier flattening.
  * 8 levels = 256 segments per curve, more than enough. */
@@ -679,11 +681,20 @@ const uint8_t *raster_get_coverage(RasterCtx *ctx)
  * which avoids the slight darkening bias of simple integer division.
  */
 
-void raster_blend(RasterCtx *ctx,
-                   uint8_t *target, int target_stride,
-                   int target_w, int target_h,
-                   int dst_x, int dst_y,
-                   int r, int g, int b)
+/* Internal blend implementation shared by raster_blend and raster_blend_clipped.
+ *
+ * The clip mask uses PAGE coordinates. When the target IS the page bitmap,
+ * (dst_x, dst_y) provides the correct mapping from coverage pixel (cx,cy) to
+ * page pixel (dst_x+cx, dst_y+cy). When the target is a temporary buffer
+ * (BitBlt fallback), callers must pass clip_off_x/clip_off_y so the clip mask
+ * lookup uses the original page position. */
+static void raster_blend_internal(RasterCtx *ctx,
+                                    uint8_t *target, int target_stride,
+                                    int target_w, int target_h,
+                                    int dst_x, int dst_y,
+                                    int r, int g, int b,
+                                    const uint8_t *clip_mask, int clip_w, int clip_h,
+                                    int clip_off_x, int clip_off_y)
 {
     if (!ctx || !target) return;
 
@@ -704,6 +715,22 @@ void raster_blend(RasterCtx *ctx,
 
             int alpha = cov_row[cx];
             if (alpha == 0) continue;
+
+            /* Apply clip mask: look up using page-space coordinates.
+             * clip_off_x/clip_off_y map the coverage origin to page coordinates. */
+            if (clip_mask) {
+                int page_x = clip_off_x + cx;
+                int page_y = clip_off_y + cy;
+                if (page_x >= 0 && page_x < clip_w && page_y >= 0 && page_y < clip_h) {
+                    int clip_val = clip_mask[page_y * clip_w + page_x];
+                    if (clip_val == 0) continue;  /* fully clipped */
+                    if (clip_val < 255) {
+                        /* Partial clip: multiply coverage by clip mask */
+                        alpha = (alpha * clip_val + 127) / 255;
+                        if (alpha == 0) continue;
+                    }
+                }
+            }
 
             uint8_t *pixel = target_row + tx * 4;
 
@@ -726,4 +753,27 @@ void raster_blend(RasterCtx *ctx,
             }
         }
     }
+}
+
+void raster_blend(RasterCtx *ctx,
+                   uint8_t *target, int target_stride,
+                   int target_w, int target_h,
+                   int dst_x, int dst_y,
+                   int r, int g, int b)
+{
+    raster_blend_internal(ctx, target, target_stride, target_w, target_h,
+                          dst_x, dst_y, r, g, b, NULL, 0, 0, 0, 0);
+}
+
+void raster_blend_clipped(RasterCtx *ctx,
+                           uint8_t *target, int target_stride,
+                           int target_w, int target_h,
+                           int dst_x, int dst_y,
+                           int r, int g, int b,
+                           const uint8_t *clip_mask, int clip_w, int clip_h,
+                           int page_x, int page_y)
+{
+    raster_blend_internal(ctx, target, target_stride, target_w, target_h,
+                          dst_x, dst_y, r, g, b,
+                          clip_mask, clip_w, clip_h, page_x, page_y);
 }

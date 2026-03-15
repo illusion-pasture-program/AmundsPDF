@@ -70,6 +70,23 @@ void raster_blend(RasterCtx *ctx,
                    int dst_x, int dst_y,
                    int r, int g, int b);
 
+/* Blend with an additional clip mask.
+ * Same as raster_blend but each pixel's coverage is ANDed with the clip mask.
+ * clip_mask: page-sized mask (255 = visible, 0 = clipped), or NULL for no clipping.
+ * clip_w, clip_h: dimensions of the clip mask (must match the page bitmap).
+ * page_x, page_y: page-space coordinates of the coverage origin.
+ *   Used to look up the correct clip mask pixel. When the target IS the page
+ *   bitmap, these equal dst_x/dst_y. When blending to a temporary buffer
+ *   (BitBlt fallback), these are the original page coordinates while dst_x/dst_y
+ *   are 0. */
+void raster_blend_clipped(RasterCtx *ctx,
+                           uint8_t *target, int target_stride,
+                           int target_w, int target_h,
+                           int dst_x, int dst_y,
+                           int r, int g, int b,
+                           const uint8_t *clip_mask, int clip_w, int clip_h,
+                           int page_x, int page_y);
+
 /* Reset the rasterizer for a new path without reallocating.
  * Clears the edge list and coverage buffer. */
 void raster_reset(RasterCtx *ctx);

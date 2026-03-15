@@ -438,6 +438,8 @@ static void gs_init(PdfGraphicsState *gs)
     gs->line_cap     = 0;
     gs->line_join    = 0;
     gs->miter_limit  = 10.0;
+    gs->dash_count   = 0;      /* solid line (no dash pattern) */
+    gs->dash_phase   = 0.0;
     gs->font_size    = 12.0;
     gs->font_name[0] = '\0';
     gs->char_spacing   = 0.0;
@@ -451,11 +453,34 @@ static void gs_init(PdfGraphicsState *gs)
     memset(&gs->stroke_cs, 0, sizeof(gs->stroke_cs));
 }
 
+/* Get the current clip mask (at the current graphics state depth).
+ * Returns NULL if no clip is active. */
+static uint8_t *current_clip_mask(PdfRenderCtx *ctx)
+{
+    return ctx->clip_mask_stack[ctx->gstate_depth];
+}
+
 static void gs_save(PdfRenderCtx *ctx)
 {
     if (ctx->gstate_depth + 1 < PDF_MAX_GSTATE_STACK) {
-        ctx->gstate[ctx->gstate_depth + 1] = ctx->gstate[ctx->gstate_depth];
+        int old_depth = ctx->gstate_depth;
+        ctx->gstate[old_depth + 1] = ctx->gstate[old_depth];
         ctx->gstate_depth++;
+
+        /* Duplicate the clip mask for the new level.
+         * Each level owns its own copy so W/W* can modify it independently. */
+        uint8_t *old_mask = ctx->clip_mask_stack[old_depth];
+        if (old_mask) {
+            size_t sz = (size_t)ctx->clip_mask_w * ctx->clip_mask_h;
+            uint8_t *new_mask = (uint8_t *)malloc(sz);
+            if (new_mask) {
+                memcpy(new_mask, old_mask, sz);
+            }
+            ctx->clip_mask_stack[ctx->gstate_depth] = new_mask;
+        } else {
+            ctx->clip_mask_stack[ctx->gstate_depth] = NULL;
+        }
+
         SaveDC(ctx->hdc);
     }
 }
@@ -463,6 +488,11 @@ static void gs_save(PdfRenderCtx *ctx)
 static void gs_restore(PdfRenderCtx *ctx)
 {
     if (ctx->gstate_depth > 0) {
+        /* Free the clip mask at the current level */
+        if (ctx->clip_mask_stack[ctx->gstate_depth]) {
+            free(ctx->clip_mask_stack[ctx->gstate_depth]);
+            ctx->clip_mask_stack[ctx->gstate_depth] = NULL;
+        }
         ctx->gstate_depth--;
         RestoreDC(ctx->hdc, -1);
     }
@@ -1138,11 +1168,17 @@ static bool path_aa_fill(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
     int dest_x = (int)bmin_x;
     int dest_y = (int)bmin_y;
 
+    /* Get the software clip mask (if any) for rasterizer clipping */
+    const uint8_t *cmask = current_clip_mask(ctx);
+    int cmask_w = ctx->clip_mask_w;
+    int cmask_h = ctx->clip_mask_h;
+
     if (page_bits) {
         /* Direct pixel access to the page bitmap */
         GdiFlush();
-        raster_blend(rctx, page_bits, page_stride, page_w, page_h,
-                     dest_x, dest_y, fr, fg, fb);
+        raster_blend_clipped(rctx, page_bits, page_stride, page_w, page_h,
+                             dest_x, dest_y, fr, fg, fb,
+                             cmask, cmask_w, cmask_h, dest_x, dest_y);
     } else {
         /* Fallback: read pixels via BitBlt, blend, write back */
         BITMAPINFO out_bmi;
@@ -1164,7 +1200,8 @@ static bool path_aa_fill(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
             GdiFlush();
 
             int stride = rw * 4;
-            raster_blend(rctx, out_bits, stride, rw, rh, 0, 0, fr, fg, fb);
+            raster_blend_clipped(rctx, out_bits, stride, rw, rh, 0, 0, fr, fg, fb,
+                                 cmask, cmask_w, cmask_h, dest_x, dest_y);
 
             BitBlt(hdc, dest_x, dest_y, rw, rh, out_dc, 0, 0, SRCCOPY);
 
@@ -1298,6 +1335,135 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
         }
     }
 
+    /* ── Apply dash pattern ──
+     * When a dash pattern is active, replace the flattened path with
+     * dashed sub-segments. Dash lengths are in user space, scaled by CTM.
+     * Per PDF spec, odd-length dash arrays are doubled (e.g. [8] -> [8 8]). */
+    if (gs->dash_count > 0) {
+        /* Normalize: if odd count, double the array so dash/gap alternate */
+        double local_dash[20];
+        int local_count = gs->dash_count;
+        for (int di = 0; di < local_count; di++)
+            local_dash[di] = gs->dash_array[di];
+        if (local_count % 2 != 0) {
+            for (int di = 0; di < gs->dash_count; di++)
+                local_dash[local_count + di] = gs->dash_array[di];
+            local_count *= 2;
+        }
+
+        double dash_total = 0;
+        for (int di = 0; di < local_count; di++)
+            dash_total += local_dash[di] * scale_factor;
+        if (dash_total < 0.01) dash_total = 1.0;
+
+        double *dash_x = (double *)malloc(MAX_FLAT_POINTS * 2 * sizeof(double));
+        double *dash_y = (double *)malloc(MAX_FLAT_POINTS * 2 * sizeof(double));
+        int *dash_cmd = (int *)malloc(MAX_FLAT_POINTS * 2 * sizeof(int));
+        if (!dash_x || !dash_y || !dash_cmd) {
+            free(dash_x); free(dash_y); free(dash_cmd);
+            free(flat_x); free(flat_y); free(flat_cmd);
+            raster_free(rctx);
+            return false;
+        }
+        int dash_out = 0;
+        int max_dash_pts = MAX_FLAT_POINTS * 2;
+
+        int dash_idx = 0;
+        double dash_remaining = local_dash[0] * scale_factor;
+        bool dash_on = true;
+
+        /* Apply phase offset */
+        double phase = gs->dash_phase * scale_factor;
+        while (phase > 0 && dash_total > 0) {
+            if (phase >= dash_remaining) {
+                phase -= dash_remaining;
+                dash_idx = (dash_idx + 1) % local_count;
+                dash_remaining = local_dash[dash_idx] * scale_factor;
+                dash_on = (dash_idx % 2 == 0);
+            } else {
+                dash_remaining -= phase;
+                phase = 0;
+            }
+        }
+
+        int init_dash_idx = dash_idx;
+        double init_dash_remaining = dash_remaining;
+        bool init_dash_on = dash_on;
+
+        double seg_prev_x = 0, seg_prev_y = 0;
+        bool need_move = true;
+
+        for (int i = 0; i < flat_count; i++) {
+            if (flat_cmd[i] == 0) {
+                seg_prev_x = flat_x[i];
+                seg_prev_y = flat_y[i];
+                need_move = true;
+                dash_idx = init_dash_idx;
+                dash_remaining = init_dash_remaining;
+                dash_on = init_dash_on;
+                continue;
+            }
+
+            double x0 = seg_prev_x, y0 = seg_prev_y;
+            double x1 = flat_x[i], y1 = flat_y[i];
+            double sdx = x1 - x0, sdy = y1 - y0;
+            double seg_len = sqrt(sdx * sdx + sdy * sdy);
+
+            if (seg_len < 1e-10) {
+                seg_prev_x = x1; seg_prev_y = y1;
+                continue;
+            }
+
+            double ux = sdx / seg_len, uy = sdy / seg_len;
+            double consumed = 0;
+
+            while (consumed < seg_len - 1e-10 && dash_out < max_dash_pts - 2) {
+                double avail = seg_len - consumed;
+                double dstep = (dash_remaining < avail) ? dash_remaining : avail;
+
+                double start_x = x0 + ux * consumed;
+                double start_y = y0 + uy * consumed;
+                double end_x = x0 + ux * (consumed + dstep);
+                double end_y = y0 + uy * (consumed + dstep);
+
+                if (dash_on) {
+                    if (need_move) {
+                        dash_x[dash_out] = start_x;
+                        dash_y[dash_out] = start_y;
+                        dash_cmd[dash_out] = 0;
+                        dash_out++;
+                        need_move = false;
+                    }
+                    if (dash_out < max_dash_pts) {
+                        dash_x[dash_out] = end_x;
+                        dash_y[dash_out] = end_y;
+                        dash_cmd[dash_out] = 1;
+                        dash_out++;
+                    }
+                }
+
+                consumed += dstep;
+                dash_remaining -= dstep;
+
+                if (dash_remaining < 1e-10) {
+                    if (dash_on) need_move = true;
+                    dash_idx = (dash_idx + 1) % local_count;
+                    dash_remaining = local_dash[dash_idx] * scale_factor;
+                    dash_on = (dash_idx % 2 == 0);
+                    if (!dash_on) need_move = true;
+                }
+            }
+
+            seg_prev_x = x1; seg_prev_y = y1;
+        }
+
+        free(flat_x); free(flat_y); free(flat_cmd);
+        flat_x = dash_x;
+        flat_y = dash_y;
+        flat_cmd = dash_cmd;
+        flat_count = dash_out;
+    }
+
     /* Now stroke each line segment as a filled quad */
     double prev_x = 0, prev_y = 0;
     double subpath_start_x = 0, subpath_start_y = 0;
@@ -1336,12 +1502,14 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
             raster_close(rctx);
 
             /* Line join handling at junction points.
-             * Only add geometry for round joins (line_join == 1).
-             * Miter joins (0) and bevel joins (2) are handled adequately
-             * by the overlapping quads for typical PDF form content. */
+             * At the start of each line segment (x0,y0), draw join geometry
+             * connecting this segment to the previous one. */
             if (gs->line_join == 1) {
-                /* Round join: draw a filled circle at the start of each segment */
-                int n_circle = 8;
+                /* Round join: draw a filled circle at the junction point.
+                 * Use adaptive segment count based on radius for quality. */
+                int n_circle = (int)(half_w * 4.0);
+                if (n_circle < 12) n_circle = 12;
+                if (n_circle > 64) n_circle = 64;
                 for (int c = 0; c < n_circle; c++) {
                     double angle = 2.0 * 3.14159265358979323846 * c / n_circle;
                     double cx = x0 + cos(angle) * half_w;
@@ -1354,8 +1522,11 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
 
             /* Line caps at the end of open subpaths */
             if (gs->line_cap == 1) {
-                /* Round cap at start and end */
-                int n_circle = 8;
+                /* Round cap: draw a filled semicircle at the end of open subpaths.
+                 * Use adaptive segment count based on radius. */
+                int n_circle = (int)(half_w * 4.0);
+                if (n_circle < 12) n_circle = 12;
+                if (n_circle > 64) n_circle = 64;
                 /* Only add end cap for the last segment in a subpath */
                 if (i + 1 >= flat_count || flat_cmd[i + 1] == 0 || flat_cmd[i] == 2) {
                     for (int c = 0; c < n_circle; c++) {
@@ -1411,10 +1582,16 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
     int dest_x = (int)bmin_x;
     int dest_y = (int)bmin_y;
 
+    /* Get the software clip mask (if any) for rasterizer clipping */
+    const uint8_t *cmask = current_clip_mask(ctx);
+    int cmask_w = ctx->clip_mask_w;
+    int cmask_h = ctx->clip_mask_h;
+
     if (page_bits) {
         GdiFlush();
-        raster_blend(rctx, page_bits, page_stride, page_w, page_h,
-                     dest_x, dest_y, sr, sg, sb);
+        raster_blend_clipped(rctx, page_bits, page_stride, page_w, page_h,
+                             dest_x, dest_y, sr, sg, sb,
+                             cmask, cmask_w, cmask_h, dest_x, dest_y);
     } else {
         BITMAPINFO out_bmi;
         memset(&out_bmi, 0, sizeof(out_bmi));
@@ -1435,7 +1612,8 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
             GdiFlush();
 
             int stride = rw * 4;
-            raster_blend(rctx, out_bits, stride, rw, rh, 0, 0, sr, sg, sb);
+            raster_blend_clipped(rctx, out_bits, stride, rw, rh, 0, 0, sr, sg, sb,
+                                 cmask, cmask_w, cmask_h, dest_x, dest_y);
 
             BitBlt(hdc, dest_x, dest_y, rw, rh, out_dc, 0, 0, SRCCOPY);
 
@@ -1507,8 +1685,30 @@ static void path_paint(PathBuilder *pb, PdfRenderCtx *ctx, int ops)
         lb.lbStyle = BS_SOLID;
         lb.lbColor = stroke_col;
         lb.lbHatch = 0;
+
+        /* Dash pattern support for GDI fallback.
+         * Odd-length arrays are doubled per PDF spec. */
+        DWORD gdi_dash[20];
+        int gdi_dash_count = 0;
+        if (gs->dash_count > 0) {
+            pen_style = PS_USERSTYLE;
+            int src_count = gs->dash_count;
+            for (int di = 0; di < src_count && di < 10; di++) {
+                gdi_dash[di] = (DWORD)(gs->dash_array[di] * scale_factor + 0.5);
+                if (gdi_dash[di] < 1) gdi_dash[di] = 1;
+                gdi_dash_count++;
+            }
+            /* Double odd-length arrays */
+            if (gdi_dash_count % 2 != 0 && gdi_dash_count <= 10) {
+                for (int di = 0; di < gdi_dash_count; di++)
+                    gdi_dash[gdi_dash_count + di] = gdi_dash[di];
+                gdi_dash_count *= 2;
+            }
+        }
+
         pen = ExtCreatePen(PS_GEOMETRIC | pen_style | end_cap | join,
-                           pen_width, &lb, 0, NULL);
+                           pen_width, &lb,
+                           gdi_dash_count, gdi_dash_count > 0 ? gdi_dash : NULL);
         if (pen) old_pen = (HPEN)SelectObject(hdc, pen);
     }
 
@@ -3244,6 +3444,36 @@ static void apply_extgstate(PdfRenderCtx *ctx, PdfDict *resources,
         }
     }
 
+    /* Dash pattern: D is [dash_array dash_phase] */
+    PdfObj *dp = pdf_dict_get(state->dict, "D");
+    if (dp) {
+        dp = pdf_resolve(ctx->doc, dp);
+        if (dp && dp->type == PDF_OBJ_ARRAY && pdf_array_len(dp->array) >= 2) {
+            PdfObj *da = pdf_array_get(dp->array, 0);
+            PdfObj *dph = pdf_array_get(dp->array, 1);
+            da = pdf_resolve(ctx->doc, da);
+            dph = pdf_resolve(ctx->doc, dph);
+            gs->dash_count = 0;
+            gs->dash_phase = 0;
+            if (da && da->type == PDF_OBJ_ARRAY) {
+                int n = pdf_array_len(da->array);
+                if (n > 10) n = 10;
+                for (int di = 0; di < n; di++) {
+                    PdfObj *v = pdf_array_get(da->array, di);
+                    v = pdf_resolve(ctx->doc, v);
+                    if (v) {
+                        if (v->type == PDF_OBJ_REAL) gs->dash_array[gs->dash_count++] = v->real;
+                        else if (v->type == PDF_OBJ_INT) gs->dash_array[gs->dash_count++] = (double)v->integer;
+                    }
+                }
+            }
+            if (dph) {
+                if (dph->type == PDF_OBJ_REAL) gs->dash_phase = dph->real;
+                else if (dph->type == PDF_OBJ_INT) gs->dash_phase = (double)dph->integer;
+            }
+        }
+    }
+
     /* Font */
     PdfObj *font = pdf_dict_get(state->dict, "Font");
     if (font) {
@@ -3707,8 +3937,26 @@ static void interpret_stream(PdfRenderCtx *ctx, PdfDict *resources,
         else if (strcmp(op, "M") == 0 && ops.count >= 1) {
             current_gs(ctx)->miter_limit = opstack_number(&ops, ops.count - 1);
         }
-        else if (strcmp(op, "d") == 0 && ops.count >= 2) {
-            /* Dash pattern: [array] phase -- store but ignore for v1 rendering */
+        else if (strcmp(op, "d") == 0 && ops.count >= 1) {
+            /* Dash pattern: [array] phase d
+             * The array was collected via the TJ array mechanism into tj_items.
+             * The phase is the last operand on the stack. */
+            PdfGraphicsState *dgs = current_gs(ctx);
+            dgs->dash_phase = opstack_number(&ops, ops.count - 1);
+            dgs->dash_count = 0;
+            for (int di = 0; di < tj_count && di < 10; di++) {
+                if (!tj_items[di].is_string) {
+                    dgs->dash_array[dgs->dash_count++] = tj_items[di].number;
+                }
+            }
+            /* Free any string data and reset tj state */
+            for (int di = 0; di < tj_count; di++) {
+                if (tj_items[di].str_data) {
+                    free(tj_items[di].str_data);
+                    tj_items[di].str_data = NULL;
+                }
+            }
+            tj_count = 0;
         }
         else if (strcmp(op, "gs") == 0 && ops.count >= 1) {
             apply_extgstate(ctx, resources, opstack_name(&ops, ops.count - 1));
@@ -3805,11 +4053,12 @@ static void interpret_stream(PdfRenderCtx *ctx, PdfDict *resources,
 
         else if (strcmp(op, "W") == 0 || strcmp(op, "W*") == 0) {
             /*
-             * Clipping: v1 approximation.
-             * We replay the current path into a GDI clipping region.
-             * Full correctness would require intersecting with the existing clip.
+             * Clipping: set GDI clip region AND build a software clip mask.
+             * The software clip mask is used by the rasterizer (path_aa_fill,
+             * path_aa_stroke) which bypasses GDI clipping entirely.
              */
             if (path.count > 0) {
+                /* 1. GDI clip path (for GDI fallback rendering) */
                 BeginPath(ctx->hdc);
                 for (int i = 0; i < path.count; i++) {
                     BYTE t = path.types[i] & ~PT_CLOSEFIGURE;
@@ -3831,6 +4080,73 @@ static void interpret_stream(PdfRenderCtx *ctx, PdfDict *resources,
                 else
                     SetPolyFillMode(ctx->hdc, WINDING);
                 SelectClipPath(ctx->hdc, RGN_AND);
+
+                /* 2. Software clip mask for the rasterizer.
+                 * Rasterize the clip path into a page-sized coverage buffer
+                 * using the existing double-precision device coordinates. */
+                int cw = ctx->clip_mask_w;
+                int ch = ctx->clip_mask_h;
+                if (cw > 0 && ch > 0) {
+                    RasterCtx *clip_rctx = raster_create(cw, ch);
+                    if (clip_rctx) {
+                        /* Replay the path using double-precision coordinates */
+                        for (int i = 0; i < path.count; i++) {
+                            BYTE t = path.types[i] & ~PT_CLOSEFIGURE;
+                            bool close = (path.types[i] & PT_CLOSEFIGURE) != 0;
+
+                            double px = path.dpts[i].x;
+                            double py = path.dpts[i].y;
+
+                            if (t == PT_MOVETO) {
+                                raster_move_to(clip_rctx, px, py);
+                            } else if (t == PT_LINETO) {
+                                raster_line_to(clip_rctx, px, py);
+                            } else if (t == PT_BEZIERTO && i + 2 < path.count) {
+                                double cx1 = path.dpts[i].x;
+                                double cy1 = path.dpts[i].y;
+                                double cx2 = path.dpts[i+1].x;
+                                double cy2 = path.dpts[i+1].y;
+                                double ex  = path.dpts[i+2].x;
+                                double ey  = path.dpts[i+2].y;
+                                raster_curve_to(clip_rctx, cx1, cy1, cx2, cy2, ex, ey);
+                                i += 2;
+                            }
+                            if (close) {
+                                raster_close(clip_rctx);
+                            }
+                        }
+
+                        /* Compute coverage with the appropriate fill rule */
+                        if (strcmp(op, "W*") == 0) {
+                            raster_finish_evenodd(clip_rctx);
+                        } else {
+                            raster_finish(clip_rctx);
+                        }
+
+                        /* Get the new clip coverage */
+                        const uint8_t *new_cov = raster_get_coverage(clip_rctx);
+                        size_t mask_sz = (size_t)cw * ch;
+
+                        /* AND with existing clip mask (for nested clips) */
+                        uint8_t *existing = ctx->clip_mask_stack[ctx->gstate_depth];
+                        if (existing) {
+                            /* Intersect: AND the new clip with the existing one */
+                            for (size_t p = 0; p < mask_sz; p++) {
+                                int combined = ((int)existing[p] * (int)new_cov[p] + 127) / 255;
+                                existing[p] = (uint8_t)combined;
+                            }
+                        } else {
+                            /* First clip at this level: allocate and copy */
+                            uint8_t *mask = (uint8_t *)malloc(mask_sz);
+                            if (mask) {
+                                memcpy(mask, new_cov, mask_sz);
+                                ctx->clip_mask_stack[ctx->gstate_depth] = mask;
+                            }
+                        }
+
+                        raster_free(clip_rctx);
+                    }
+                }
             }
             /* Note: the path is NOT consumed by W/W*; the next painting operator
              * (or 'n') will consume it. */
@@ -4363,6 +4679,10 @@ HBITMAP pdf_render_page(PdfDocument *doc, int page_idx, double scale,
     ctx.doc = doc;
     ctx.gstate_depth = 0;
 
+    /* Initialize software clip mask dimensions (all masks NULL = no clipping) */
+    ctx.clip_mask_w = px_w;
+    ctx.clip_mask_h = px_h;
+
     /* Initialize graphics state */
     gs_init(&ctx.gstate[0]);
 
@@ -4406,6 +4726,14 @@ HBITMAP pdf_render_page(PdfDocument *doc, int page_idx, double scale,
             interpret_stream(&ctx, resources, content_data, content_len);
         }
         free(content_data);
+    }
+
+    /* Free any remaining clip masks on the stack */
+    for (int i = 0; i <= ctx.gstate_depth; i++) {
+        if (ctx.clip_mask_stack[i]) {
+            free(ctx.clip_mask_stack[i]);
+            ctx.clip_mask_stack[i] = NULL;
+        }
     }
 
     /* Cleanup */

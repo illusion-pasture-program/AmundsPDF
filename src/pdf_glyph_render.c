@@ -326,7 +326,8 @@ static bool glyph_device_bounds(GlyphOutline *outline,
  * 5. Get the page bitmap pixel pointer and alpha-blend directly
  */
 static void render_glyph_outline(HDC hdc, GlyphOutline *outline, ParsedFont *font,
-                                  double font_size, PdfMatrix combined, COLORREF color)
+                                  double font_size, PdfMatrix combined, COLORREF color,
+                                  const uint8_t *clip_mask, int clip_mask_w, int clip_mask_h)
 {
     if (!outline || outline->count == 0) return;
     if (font->units_per_em <= 0) return;
@@ -433,8 +434,9 @@ static void render_glyph_outline(HDC hdc, GlyphOutline *outline, ParsedFont *fon
             GdiFlush();
 
             int stride = glyph_w * 4;
-            raster_blend(rctx, out_bits, stride, glyph_w, glyph_h, 0, 0,
-                         GetRValue(color), GetGValue(color), GetBValue(color));
+            raster_blend_clipped(rctx, out_bits, stride, glyph_w, glyph_h, 0, 0,
+                                 GetRValue(color), GetGValue(color), GetBValue(color),
+                                 clip_mask, clip_mask_w, clip_mask_h, dest_x, dest_y);
 
             BitBlt(hdc, dest_x, dest_y, glyph_w, glyph_h, out_dc, 0, 0, SRCCOPY);
 
@@ -460,9 +462,10 @@ static void render_glyph_outline(HDC hdc, GlyphOutline *outline, ParsedFont *fon
     int dest_y = (int)bmin_y;
 
     /* Blend the rasterized coverage directly onto the page bitmap */
-    raster_blend(rctx, page_bits, page_stride, page_w, page_h,
-                 dest_x, dest_y,
-                 GetRValue(color), GetGValue(color), GetBValue(color));
+    raster_blend_clipped(rctx, page_bits, page_stride, page_w, page_h,
+                         dest_x, dest_y,
+                         GetRValue(color), GetGValue(color), GetBValue(color),
+                         clip_mask, clip_mask_w, clip_mask_h, dest_x, dest_y);
 
     raster_free(rctx);
 }
@@ -1073,7 +1076,9 @@ bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
                 }
 
                 render_glyph_outline(ctx->hdc, &outline, font, font_size,
-                                      combined, text_color);
+                                      combined, text_color,
+                                      ctx->clip_mask_stack[ctx->gstate_depth],
+                                      ctx->clip_mask_w, ctx->clip_mask_h);
             }
 
             if (got_glyph) {
@@ -1176,7 +1181,9 @@ bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
 
             /* Render the glyph with anti-aliasing */
             render_glyph_outline(ctx->hdc, &outline, font, font_size,
-                                  combined, text_color);
+                                  combined, text_color,
+                                  ctx->clip_mask_stack[ctx->gstate_depth],
+                                  ctx->clip_mask_w, ctx->clip_mask_h);
         }
 
         if (got_glyph) {

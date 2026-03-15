@@ -194,6 +194,9 @@ typedef struct {
     int         line_cap;       /* 0=butt, 1=round, 2=square */
     int         line_join;      /* 0=miter, 1=round, 2=bevel */
     double      miter_limit;
+    double      dash_array[10];  /* dash pattern lengths (user space) */
+    int         dash_count;      /* number of entries in dash_array (0 = solid) */
+    double      dash_phase;      /* starting phase offset */
     double      font_size;
     char        font_name[PDF_MAX_NAME_LEN];
     /* Text state */
@@ -227,6 +230,13 @@ typedef struct {
 
     /* Reference to document for resolving indirect refs */
     PdfDocument *doc;
+
+    /* Software clip mask stack for rasterizer clipping.
+     * Each level stores a full-page coverage mask (255 = visible, 0 = clipped).
+     * NULL means no clip (everything visible). */
+    uint8_t    *clip_mask_stack[PDF_MAX_GSTATE_STACK];
+    int         clip_mask_w;    /* width of clip masks (= page_width_px) */
+    int         clip_mask_h;    /* height of clip masks (= page_height_px) */
 } PdfRenderCtx;
 
 /* ─── Utility Macros ─── */
