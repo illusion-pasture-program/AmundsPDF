@@ -47,6 +47,10 @@ void raster_close(RasterCtx *ctx);
  * After this call, the coverage buffer is ready for blending. */
 void raster_finish(RasterCtx *ctx);
 
+/* Finish path using even-odd fill rule.
+ * Same as raster_finish() but uses even-odd instead of nonzero winding. */
+void raster_finish_evenodd(RasterCtx *ctx);
+
 /* Get the coverage buffer.
  * Returns a width x height array of uint8_t values (0=transparent, 255=opaque).
  * The buffer is owned by the RasterCtx (don't free it). */

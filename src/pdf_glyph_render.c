@@ -814,6 +814,240 @@ static PdfEncodingMap *get_cached_encoding(PdfDocument *doc, PdfDict *resources,
     return NULL;
 }
 
+/* ─── Type0/CID Font Helpers ─── */
+
+/* Resolve CID width from /W array and /DW default.
+ *
+ * /W array format (from CIDFont dict):
+ *   c [w1 w2 w3 ...]   — CIDs c, c+1, c+2, ... get widths w1, w2, w3, ...
+ *   c_first c_last w    — CIDs c_first through c_last all get width w
+ *
+ * Returns width in font units (typically 1/1000 of text space).
+ */
+static double cid_get_width(PdfDocument *doc, PdfArray *w_array,
+                             int default_w, int cid)
+{
+    if (!w_array) return (double)default_w;
+
+    int n = pdf_array_len(w_array);
+    int i = 0;
+
+    while (i < n) {
+        PdfObj *first_obj = pdf_array_get(w_array, i);
+        if (!first_obj) break;
+        first_obj = pdf_resolve(doc, first_obj);
+        if (!first_obj || first_obj->type != PDF_OBJ_INT) break;
+
+        int first_cid = (int)first_obj->integer;
+        i++;
+        if (i >= n) break;
+
+        PdfObj *second_obj = pdf_array_get(w_array, i);
+        if (!second_obj) break;
+        second_obj = pdf_resolve(doc, second_obj);
+        if (!second_obj) break;
+
+        if (second_obj->type == PDF_OBJ_ARRAY) {
+            /* Format: c [w1 w2 w3 ...] */
+            PdfArray *widths = second_obj->array;
+            int wcount = pdf_array_len(widths);
+            int offset = cid - first_cid;
+            if (offset >= 0 && offset < wcount) {
+                PdfObj *w_obj = pdf_array_get(widths, offset);
+                if (w_obj) {
+                    w_obj = pdf_resolve(doc, w_obj);
+                    if (w_obj) {
+                        if (w_obj->type == PDF_OBJ_INT)
+                            return (double)w_obj->integer;
+                        if (w_obj->type == PDF_OBJ_REAL)
+                            return w_obj->real;
+                    }
+                }
+            }
+            i++;
+        } else if (second_obj->type == PDF_OBJ_INT) {
+            /* Format: c_first c_last w */
+            int last_cid = (int)second_obj->integer;
+            i++;
+            if (i >= n) break;
+
+            PdfObj *w_obj = pdf_array_get(w_array, i);
+            if (!w_obj) break;
+            w_obj = pdf_resolve(doc, w_obj);
+            i++;
+
+            if (cid >= first_cid && cid <= last_cid && w_obj) {
+                if (w_obj->type == PDF_OBJ_INT)
+                    return (double)w_obj->integer;
+                if (w_obj->type == PDF_OBJ_REAL)
+                    return w_obj->real;
+            }
+        } else {
+            break; /* unexpected format */
+        }
+    }
+
+    return (double)default_w;
+}
+
+/* Detect whether a font resource is a Type0 (composite) font and extract
+ * the CID font parameters needed for rendering.
+ *
+ * On success, sets:
+ *   *out_is_type0 = true
+ *   *out_default_w = /DW value (default 1000)
+ *   *out_w_array = /W array (may be NULL)
+ *   *out_cidtogidmap_data = decoded CIDToGIDMap stream data (NULL if Identity)
+ *   *out_cidtogidmap_len = length of CIDToGIDMap data
+ *   *out_is_identity_h = true if /Encoding is Identity-H or Identity-V (2-byte)
+ */
+typedef struct {
+    bool is_type0;
+    bool is_identity_h;
+    int  default_w;
+    PdfArray *w_array;
+    const uint8_t *cidtogidmap_data;
+    size_t cidtogidmap_len;
+} CidFontInfo;
+
+static void detect_type0_font(PdfDocument *doc, PdfDict *resources,
+                               const char *font_res_name, CidFontInfo *info)
+{
+    memset(info, 0, sizeof(*info));
+    info->default_w = 1000;
+
+    /* Get /Font dictionary from resources */
+    PdfObj *fonts_obj = pdf_dict_get(resources, "Font");
+    if (!fonts_obj) return;
+    fonts_obj = pdf_resolve(doc, fonts_obj);
+    if (!fonts_obj || fonts_obj->type != PDF_OBJ_DICT) return;
+
+    /* Get the specific font dict (e.g., /F1) */
+    PdfObj *font_obj = pdf_dict_get(fonts_obj->dict, font_res_name);
+    if (!font_obj) return;
+    font_obj = pdf_resolve(doc, font_obj);
+    if (!font_obj || font_obj->type != PDF_OBJ_DICT) return;
+
+    /* Check /Subtype == /Type0 */
+    const char *subtype = pdf_dict_get_name(font_obj->dict, "Subtype");
+    if (!subtype || strcmp(subtype, "Type0") != 0)
+        return;
+
+    info->is_type0 = true;
+
+    /* Check /Encoding (Identity-H or Identity-V mean 2-byte codes) */
+    const char *encoding = pdf_dict_get_name(font_obj->dict, "Encoding");
+    if (encoding && (strcmp(encoding, "Identity-H") == 0 ||
+                     strcmp(encoding, "Identity-V") == 0)) {
+        info->is_identity_h = true;
+    }
+
+    /* Navigate to DescendantFonts -> first CIDFont dict */
+    PdfObj *descendants = pdf_dict_get(font_obj->dict, "DescendantFonts");
+    if (!descendants) return;
+    descendants = pdf_resolve(doc, descendants);
+    if (!descendants || descendants->type != PDF_OBJ_ARRAY) return;
+    if (pdf_array_len(descendants->array) < 1) return;
+
+    PdfObj *cid_font = pdf_array_get(descendants->array, 0);
+    cid_font = pdf_resolve(doc, cid_font);
+    if (!cid_font || cid_font->type != PDF_OBJ_DICT) return;
+
+    /* Get /DW (default width, default 1000) */
+    info->default_w = pdf_dict_get_int(cid_font->dict, "DW", 1000);
+
+    /* Get /W (per-CID width overrides) */
+    PdfObj *w_obj = pdf_dict_get(cid_font->dict, "W");
+    if (w_obj) {
+        w_obj = pdf_resolve(doc, w_obj);
+        if (w_obj && w_obj->type == PDF_OBJ_ARRAY)
+            info->w_array = w_obj->array;
+    }
+
+    /* Get /CIDToGIDMap */
+    PdfObj *cidtogid = pdf_dict_get(cid_font->dict, "CIDToGIDMap");
+    if (cidtogid) {
+        cidtogid = pdf_resolve(doc, cidtogid);
+        if (cidtogid) {
+            if (cidtogid->type == PDF_OBJ_NAME) {
+                /* /Identity — CID == GID, nothing to do */
+            } else if (cidtogid->type == PDF_OBJ_STREAM) {
+                /* Stream: big-endian uint16 table, gid = data[cid*2]<<8 | data[cid*2+1] */
+                if (pdf_decode_stream(doc, cidtogid->stream)) {
+                    info->cidtogidmap_data = cidtogid->stream->decoded_data;
+                    info->cidtogidmap_len = cidtogid->stream->decoded_length;
+                }
+            }
+        }
+    }
+}
+
+/* Map CID to GID using a CIDToGIDMap stream (big-endian uint16 table).
+ * If no map is provided (Identity), returns cid unchanged. */
+static int cid_to_gid(const CidFontInfo *info, int cid)
+{
+    if (info->cidtogidmap_data && info->cidtogidmap_len > 0) {
+        size_t offset = (size_t)cid * 2;
+        if (offset + 1 < info->cidtogidmap_len) {
+            return (info->cidtogidmap_data[offset] << 8) |
+                    info->cidtogidmap_data[offset + 1];
+        }
+        return 0; /* CID out of range of map */
+    }
+    /* Identity: CID == GID */
+    return cid;
+}
+
+/* ─── Render a single glyph and advance the text matrix ─── */
+
+static void render_and_advance_glyph(PdfRenderCtx *ctx, ParsedFont *font,
+                                      double font_size, double h_scale,
+                                      COLORREF text_color, int gid,
+                                      double advance_width)
+{
+    PdfGraphicsState *gs = &ctx->gstate[ctx->gstate_depth];
+
+    /* Get glyph outline */
+    GlyphOutline outline;
+    glyph_outline_init(&outline);
+    bool got_glyph = parsed_font_get_glyph_by_gid(font, gid, &outline);
+
+    if (got_glyph && outline.count > 0 && gs->text_render_mode != 3) {
+        /* Compute combined matrix: text_matrix * CTM */
+        PdfMatrix combined = pdf_matrix_multiply(ctx->text_matrix, gs->ctm);
+
+        /* Apply text rise */
+        if (gs->text_rise != 0.0) {
+            PdfMatrix rise = PDF_IDENTITY_MATRIX;
+            rise.f = gs->text_rise;
+            combined = pdf_matrix_multiply(rise, combined);
+        }
+
+        render_glyph_outline(ctx->hdc, &outline, font, font_size,
+                              combined, text_color);
+    }
+
+    if (got_glyph) {
+        glyph_outline_free(&outline);
+
+        /* If glyph reported its own width, prefer that */
+        if (outline.advance_width != 0.0)
+            advance_width = outline.advance_width;
+    }
+
+    /* Advance text position */
+    double advance = (advance_width / (double)font->units_per_em) * font_size;
+
+    advance += gs->char_spacing;
+    advance *= h_scale;
+
+    PdfMatrix adv = PDF_IDENTITY_MATRIX;
+    adv.e = advance;
+    ctx->text_matrix = pdf_matrix_multiply(adv, ctx->text_matrix);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
 bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
                                const uint8_t *str, size_t len)
 {
@@ -848,6 +1082,75 @@ bool glyph_render_text_string(PdfRenderCtx *ctx, PdfDict *resources,
     }
 
     double h_scale = gs->horiz_scaling / 100.0;
+
+    /* ─── Type0/CID Composite Font Path ─── */
+    CidFontInfo cid_info;
+    detect_type0_font(ctx->doc, resources, gs->font_name, &cid_info);
+
+    if (cid_info.is_type0 && cid_info.is_identity_h) {
+        /* Type0 font with Identity-H encoding: 2-byte character codes.
+         * Each pair of bytes forms a CID: (str[i] << 8) | str[i+1]
+         * CID -> GID via CIDToGIDMap (Identity or stream)
+         * Width from /W array and /DW default */
+
+        for (size_t i = 0; i + 1 < len; i += 2) {
+            int cid = ((int)str[i] << 8) | (int)str[i + 1];
+            int gid = cid_to_gid(&cid_info, cid);
+
+            /* Get width for this CID from /W array (in 1/1000 units) */
+            double cid_width = cid_get_width(ctx->doc, cid_info.w_array,
+                                              cid_info.default_w, cid);
+
+            /* Convert CID width (1/1000 units) to font design units.
+             * CID widths are always in 1/1000 of text space, but the font's
+             * units_per_em may differ. Scale accordingly. */
+            double advance_width = cid_width * ((double)font->units_per_em / 1000.0);
+
+            /* Get glyph outline by GID */
+            GlyphOutline outline;
+            glyph_outline_init(&outline);
+            bool got_glyph = parsed_font_get_glyph_by_gid(font, gid, &outline);
+
+            if (got_glyph && outline.count > 0 && gs->text_render_mode != 3) {
+                PdfMatrix combined = pdf_matrix_multiply(ctx->text_matrix, gs->ctm);
+
+                if (gs->text_rise != 0.0) {
+                    PdfMatrix rise = PDF_IDENTITY_MATRIX;
+                    rise.f = gs->text_rise;
+                    combined = pdf_matrix_multiply(rise, combined);
+                }
+
+                render_glyph_outline(ctx->hdc, &outline, font, font_size,
+                                      combined, text_color);
+            }
+
+            if (got_glyph) {
+                glyph_outline_free(&outline);
+            }
+
+            /* Advance text position using CID width */
+            double advance = (advance_width / (double)font->units_per_em) * font_size;
+
+            advance += gs->char_spacing;
+
+            /* Word spacing for CID 0 (space) — PDF spec says word spacing
+             * applies to single-byte code 32, but for CID fonts it applies
+             * to CID that maps to space. In practice, check for CID == space
+             * character codes commonly used. */
+            if (cid == 0x0003 || cid == 0x0020 || cid == 32)
+                advance += gs->word_spacing;
+
+            advance *= h_scale;
+
+            PdfMatrix adv = PDF_IDENTITY_MATRIX;
+            adv.e = advance;
+            ctx->text_matrix = pdf_matrix_multiply(adv, ctx->text_matrix);
+        }
+
+        return true;
+    }
+
+    /* ─── Simple Font Path (original 1-byte character codes) ─── */
 
     /* Get PDF encoding map for this font (if available) */
     PdfEncodingMap *enc_map = NULL;

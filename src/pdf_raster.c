@@ -257,8 +257,9 @@ RasterCtx *raster_create(int width, int height)
     if (width <= 0 || height <= 0)
         return NULL;
 
-    /* Guard against unreasonable sizes (e.g., > 8K pixels per glyph) */
-    if (width > 8192 || height > 8192)
+    /* Guard against unreasonable sizes.
+     * Raised to 16384 to support page-wide path rendering, not just glyphs. */
+    if (width > 16384 || height > 16384)
         return NULL;
 
     RasterCtx *ctx = (RasterCtx *)calloc(1, sizeof(RasterCtx));
@@ -503,7 +504,13 @@ static void sort_crossings(double *xs, int *dirs, int n)
     }
 }
 
-void raster_finish(RasterCtx *ctx)
+/* Fill rule constants for raster_finish_internal */
+#define FILL_RULE_NONZERO  0
+#define FILL_RULE_EVENODD  1
+
+/* Internal finish function that supports both fill rules.
+ * fill_rule: FILL_RULE_NONZERO or FILL_RULE_EVENODD */
+static void raster_finish_internal(RasterCtx *ctx, int fill_rule)
 {
     if (!ctx) return;
     if (ctx->edge_count == 0) return;
@@ -561,25 +568,26 @@ void raster_finish(RasterCtx *ctx)
             sort_crossings(ctx->crossings, ctx->crossing_dirs, ctx->crossing_count);
         }
 
-        /* Walk crossings left-to-right applying nonzero winding rule.
-         * Between each pair of crossings where winding != 0, the scanline
-         * is "inside" the path. */
+        /* Walk crossings left-to-right applying the chosen fill rule.
+         * Nonzero winding: inside when winding != 0
+         * Even-odd: inside when (crossing_count_so_far % 2) != 0 */
         int winding = 0;
         for (int c = 0; c < ctx->crossing_count; c++) {
-            int prev_winding = winding;
             winding += ctx->crossing_dirs[c];
 
-            /* If we just entered the path (was outside, now inside) or
-             * just left the path (was inside, now outside), we have a
-             * span boundary. We need to fill pixels between "enter" and "exit". */
-            if (prev_winding == 0 && winding != 0) {
-                /* Entering the path: remember this x as span start.
-                 * We'll handle it when we exit. Actually, it's simpler to
-                 * process spans between consecutive crossings. */
+            /* Determine if we're "inside" after this crossing */
+            int inside;
+            if (fill_rule == FILL_RULE_EVENODD) {
+                /* Even-odd: count total crossings seen so far.
+                 * Inside when an odd number of crossings have been passed. */
+                inside = ((c + 1) % 2 != 0);
+            } else {
+                /* Nonzero winding: inside when winding count is non-zero */
+                inside = (winding != 0);
             }
 
-            /* Between crossing c and c+1, if winding != 0, those pixels are inside. */
-            if (winding != 0 && c + 1 < ctx->crossing_count) {
+            /* Between crossing c and c+1, if inside, those pixels are filled. */
+            if (inside && c + 1 < ctx->crossing_count) {
                 double x_start = ctx->crossings[c];
                 double x_end   = ctx->crossings[c + 1];
 
@@ -637,6 +645,16 @@ void raster_finish(RasterCtx *ctx)
     }
 
     free(row_counts);
+}
+
+void raster_finish(RasterCtx *ctx)
+{
+    raster_finish_internal(ctx, FILL_RULE_NONZERO);
+}
+
+void raster_finish_evenodd(RasterCtx *ctx)
+{
+    raster_finish_internal(ctx, FILL_RULE_EVENODD);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

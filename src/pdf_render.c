@@ -654,7 +654,7 @@ static bool path_bbox(PathBuilder *pb, double *min_x, double *min_y,
         if (px > *max_x) *max_x = px;
         if (py > *max_y) *max_y = py;
     }
-    return (*max_x > *min_x) && (*max_y > *min_y);
+    return (*max_x >= *min_x) && (*max_y >= *min_y);
 }
 
 /*
@@ -952,12 +952,12 @@ static bool path_aa_stroke(PathBuilder *pb, PdfRenderCtx *ctx)
             raster_line_to(rctx, x0 - nx, y0 - ny);
             raster_close(rctx);
 
-            /* Add round line join: draw a circle at each junction point.
-             * For miter joins we'd compute the miter, but circles at joints
-             * provide acceptable results for most PDF content.
-             * We approximate the circle with an octagon. */
-            if (gs->line_join == 1 || dev_width > 2.0) {
-                /* Add a filled circle at the start of each segment for joins */
+            /* Line join handling at junction points.
+             * Only add geometry for round joins (line_join == 1).
+             * Miter joins (0) and bevel joins (2) are handled adequately
+             * by the overlapping quads for typical PDF form content. */
+            if (gs->line_join == 1) {
+                /* Round join: draw a filled circle at the start of each segment */
                 int n_circle = 8;
                 for (int c = 0; c < n_circle; c++) {
                     double angle = 2.0 * 3.14159265358979323846 * c / n_circle;
