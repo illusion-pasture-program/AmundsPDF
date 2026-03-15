@@ -158,6 +158,33 @@ typedef struct {
     double r, g, b;     /* normalized 0..1 */
 } PdfColor;
 
+/* ─── Color Space Types ─── */
+typedef enum {
+    PDF_CS_UNKNOWN = 0,
+    PDF_CS_DEVICE_GRAY,
+    PDF_CS_DEVICE_RGB,
+    PDF_CS_DEVICE_CMYK,
+    PDF_CS_ICCBASED,
+    PDF_CS_INDEXED,
+    PDF_CS_SEPARATION,
+    PDF_CS_DEVICEN,
+    PDF_CS_PATTERN,
+} PdfColorSpaceType;
+
+#define PDF_MAX_INDEXED_PALETTE  256  /* max entries in an Indexed palette */
+
+typedef struct {
+    PdfColorSpaceType type;
+    int               components;            /* number of input components */
+    char              name[PDF_MAX_NAME_LEN]; /* resource name (e.g. "CS0") */
+
+    /* For Indexed color spaces */
+    int               indexed_hival;          /* max palette index */
+    uint8_t           indexed_palette[PDF_MAX_INDEXED_PALETTE * 4]; /* palette RGB(A) data */
+    int               indexed_base_components; /* components per entry in base space (3=RGB, 4=CMYK, 1=Gray) */
+    PdfColorSpaceType indexed_base_type;       /* base color space type */
+} PdfColorSpaceInfo;
+
 /* ─── Graphics State ─── */
 typedef struct {
     PdfMatrix   ctm;            /* current transformation matrix */
@@ -176,6 +203,9 @@ typedef struct {
     double      leading;
     int         text_render_mode;
     double      text_rise;
+    /* Color space state */
+    PdfColorSpaceInfo fill_cs;
+    PdfColorSpaceInfo stroke_cs;
 } PdfGraphicsState;
 
 /* ─── Render Context (passed to renderer) ─── */

@@ -3741,20 +3741,28 @@ static void interpret_stream(PdfRenderCtx *ctx, PdfDict *resources,
         else if (strcmp(op, "g") == 0 && ops.count >= 1) {
             double gray = opstack_number(&ops, ops.count - 1);
             current_gs(ctx)->fill_color = (PdfColor){gray, gray, gray};
+            current_gs(ctx)->fill_cs.type = PDF_CS_DEVICE_GRAY;
+            current_gs(ctx)->fill_cs.components = 1;
         }
         else if (strcmp(op, "G") == 0 && ops.count >= 1) {
             double gray = opstack_number(&ops, ops.count - 1);
             current_gs(ctx)->stroke_color = (PdfColor){gray, gray, gray};
+            current_gs(ctx)->stroke_cs.type = PDF_CS_DEVICE_GRAY;
+            current_gs(ctx)->stroke_cs.components = 1;
         }
         else if (strcmp(op, "rg") == 0 && ops.count >= 3) {
             current_gs(ctx)->fill_color.r = opstack_number(&ops, ops.count - 3);
             current_gs(ctx)->fill_color.g = opstack_number(&ops, ops.count - 2);
             current_gs(ctx)->fill_color.b = opstack_number(&ops, ops.count - 1);
+            current_gs(ctx)->fill_cs.type = PDF_CS_DEVICE_RGB;
+            current_gs(ctx)->fill_cs.components = 3;
         }
         else if (strcmp(op, "RG") == 0 && ops.count >= 3) {
             current_gs(ctx)->stroke_color.r = opstack_number(&ops, ops.count - 3);
             current_gs(ctx)->stroke_color.g = opstack_number(&ops, ops.count - 2);
             current_gs(ctx)->stroke_color.b = opstack_number(&ops, ops.count - 1);
+            current_gs(ctx)->stroke_cs.type = PDF_CS_DEVICE_RGB;
+            current_gs(ctx)->stroke_cs.components = 3;
         }
         else if (strcmp(op, "k") == 0 && ops.count >= 4) {
             double c_ = opstack_number(&ops, ops.count - 4);
@@ -3762,6 +3770,8 @@ static void interpret_stream(PdfRenderCtx *ctx, PdfDict *resources,
             double y_ = opstack_number(&ops, ops.count - 2);
             double k_ = opstack_number(&ops, ops.count - 1);
             current_gs(ctx)->fill_color = cmyk_to_rgb(c_, m_, y_, k_);
+            current_gs(ctx)->fill_cs.type = PDF_CS_DEVICE_CMYK;
+            current_gs(ctx)->fill_cs.components = 4;
         }
         else if (strcmp(op, "K") == 0 && ops.count >= 4) {
             double c_ = opstack_number(&ops, ops.count - 4);
@@ -3769,6 +3779,8 @@ static void interpret_stream(PdfRenderCtx *ctx, PdfDict *resources,
             double y_ = opstack_number(&ops, ops.count - 2);
             double k_ = opstack_number(&ops, ops.count - 1);
             current_gs(ctx)->stroke_color = cmyk_to_rgb(c_, m_, y_, k_);
+            current_gs(ctx)->stroke_cs.type = PDF_CS_DEVICE_CMYK;
+            current_gs(ctx)->stroke_cs.components = 4;
         }
         else if (strcmp(op, "cs") == 0 && ops.count >= 1) {
             /* Set fill color space: resolve from resources */
