@@ -33,6 +33,8 @@
 #define ZOOM_IN_FACTOR      1.25
 #define ZOOM_OUT_FACTOR     0.8
 
+#define MIN_RENDER_SCALE    1.5     /* oversample threshold for sharp text */
+
 #define TIMER_RESIZE        1
 #define TIMER_RESIZE_MS     100
 
@@ -67,8 +69,11 @@ typedef struct {
 
     /* Rendered page cache */
     HBITMAP     hPageBitmap;
-    int         page_bmp_w;
-    int         page_bmp_h;
+    int         page_bmp_w;         /* raw bitmap width (render_scale) */
+    int         page_bmp_h;         /* raw bitmap height (render_scale) */
+    int         display_w;          /* display width (at user zoom) */
+    int         display_h;          /* display height (at user zoom) */
+    double      render_scale;       /* actual scale bitmap was rendered at */
     int         rendered_page;      /* which page is cached */
     double      rendered_zoom;      /* at what zoom level */
 
@@ -462,6 +467,9 @@ static void CloseDocument(void)
 
     g_app.page_bmp_w = 0;
     g_app.page_bmp_h = 0;
+    g_app.display_w = 0;
+    g_app.display_h = 0;
+    g_app.render_scale = 0.0;
     g_app.rendered_page = -1;
     g_app.rendered_zoom = -1.0;
     g_app.current_page = 0;
@@ -565,18 +573,33 @@ static void RenderCurrentPage(void)
         g_app.hPageBitmap = NULL;
     }
 
+    /* Render at a minimum quality level for sharp text when zoomed out */
+    double render_scale = effective_zoom;
+    if (render_scale < MIN_RENDER_SCALE)
+        render_scale = MIN_RENDER_SCALE;
+
     int w = 0, h = 0;
     g_app.hPageBitmap = pdf_render_page(&g_app.doc, g_app.current_page,
-                                         effective_zoom, &w, &h);
+                                         render_scale, &w, &h);
 
     if (g_app.hPageBitmap) {
         g_app.page_bmp_w = w;
         g_app.page_bmp_h = h;
+        g_app.render_scale = render_scale;
+
+        /* Compute display dimensions (what the user sees at their zoom level) */
+        double display_ratio = effective_zoom / render_scale;
+        g_app.display_w = (int)(w * display_ratio + 0.5);
+        g_app.display_h = (int)(h * display_ratio + 0.5);
+
         g_app.rendered_page = g_app.current_page;
         g_app.rendered_zoom = effective_zoom;
     } else {
         g_app.page_bmp_w = 0;
         g_app.page_bmp_h = 0;
+        g_app.display_w = 0;
+        g_app.display_h = 0;
+        g_app.render_scale = 0.0;
         g_app.rendered_page = -1;
         g_app.rendered_zoom = -1.0;
     }
@@ -591,8 +614,8 @@ static void UpdateScrollLimits(void)
     int cw = rc.right - rc.left;
     int ch = rc.bottom - rc.top;
 
-    int content_w = g_app.page_bmp_w + 2 * PAGE_MARGIN;
-    int content_h = g_app.page_bmp_h + 2 * PAGE_MARGIN;
+    int content_w = g_app.display_w + 2 * PAGE_MARGIN;
+    int content_h = g_app.display_h + 2 * PAGE_MARGIN;
 
     g_app.max_scroll_x = content_w > cw ? content_w - cw : 0;
     g_app.max_scroll_y = content_h > ch ? content_h - ch : 0;
@@ -621,9 +644,9 @@ static void ApplyZoom(double new_zoom, bool is_fit_width)
 
     double center_rx = 0.5;
     double center_ry = 0.5;
-    if (g_app.page_bmp_w > 0 && g_app.page_bmp_h > 0) {
-        int content_w = g_app.page_bmp_w + 2 * PAGE_MARGIN;
-        int content_h = g_app.page_bmp_h + 2 * PAGE_MARGIN;
+    if (g_app.display_w > 0 && g_app.display_h > 0) {
+        int content_w = g_app.display_w + 2 * PAGE_MARGIN;
+        int content_h = g_app.display_h + 2 * PAGE_MARGIN;
         center_rx = (content_w > 0) ? (double)(g_app.scroll_x + cw / 2) / content_w : 0.5;
         center_ry = (content_h > 0) ? (double)(g_app.scroll_y + ch / 2) / content_h : 0.5;
     }
@@ -637,8 +660,8 @@ static void ApplyZoom(double new_zoom, bool is_fit_width)
     RenderCurrentPage();
 
     /* Restore view center */
-    int new_content_w = g_app.page_bmp_w + 2 * PAGE_MARGIN;
-    int new_content_h = g_app.page_bmp_h + 2 * PAGE_MARGIN;
+    int new_content_w = g_app.display_w + 2 * PAGE_MARGIN;
+    int new_content_h = g_app.display_h + 2 * PAGE_MARGIN;
     g_app.scroll_x = (int)(center_rx * new_content_w - cw / 2);
     g_app.scroll_y = (int)(center_ry * new_content_h - ch / 2);
     ClampScroll();
@@ -927,7 +950,7 @@ static void PaintWindow(HDC hdc, const RECT *rcClient)
     FillRect(hdc, rcClient, g_app.hBgBrush);
 
     if (!g_app.doc_loaded || !g_app.hPageBitmap ||
-        g_app.page_bmp_w == 0 || g_app.page_bmp_h == 0) {
+        g_app.display_w == 0 || g_app.display_h == 0) {
         /* No document -- show hint text */
         SetTextColor(hdc, TEXT_HINT_COLOR);
         SetBkMode(hdc, TRANSPARENT);
@@ -949,20 +972,24 @@ static void PaintWindow(HDC hdc, const RECT *rcClient)
         return;
     }
 
+    /* Use display dimensions for layout (may differ from bitmap size when oversampled) */
+    int dw = g_app.display_w;
+    int dh = g_app.display_h;
+
     /* Calculate page position (centered if smaller, or scrolled) */
     int page_x, page_y;
 
-    if (g_app.page_bmp_w + 2 * PAGE_MARGIN <= cw) {
+    if (dw + 2 * PAGE_MARGIN <= cw) {
         /* Page fits horizontally: center it */
-        page_x = (cw - g_app.page_bmp_w) / 2;
+        page_x = (cw - dw) / 2;
     } else {
         /* Page wider than window: apply horizontal scroll */
         page_x = PAGE_MARGIN - g_app.scroll_x;
     }
 
-    if (g_app.page_bmp_h + 2 * PAGE_MARGIN <= ch) {
+    if (dh + 2 * PAGE_MARGIN <= ch) {
         /* Page fits vertically: center it */
-        page_y = (ch - g_app.page_bmp_h) / 2;
+        page_y = (ch - dh) / 2;
     } else {
         /* Page taller than window: apply vertical scroll */
         page_y = PAGE_MARGIN - g_app.scroll_y;
@@ -972,8 +999,8 @@ static void PaintWindow(HDC hdc, const RECT *rcClient)
     RECT rcShadow = {
         page_x + SHADOW_OFFSET,
         page_y + SHADOW_OFFSET,
-        page_x + g_app.page_bmp_w + SHADOW_OFFSET,
-        page_y + g_app.page_bmp_h + SHADOW_OFFSET
+        page_x + dw + SHADOW_OFFSET,
+        page_y + dh + SHADOW_OFFSET
     };
     FillRect(hdc, &rcShadow, g_app.hShadowBrush);
 
@@ -984,19 +1011,27 @@ static void PaintWindow(HDC hdc, const RECT *rcClient)
 
     Rectangle(hdc,
         page_x - 1, page_y - 1,
-        page_x + g_app.page_bmp_w + 1,
-        page_y + g_app.page_bmp_h + 1);
+        page_x + dw + 1,
+        page_y + dh + 1);
 
     SelectObject(hdc, hOldBr);
     SelectObject(hdc, hOldPen);
     DeleteObject(hBorderPen);
 
-    /* BitBlt the rendered page */
+    /* Blit the rendered page to screen */
     HDC hdcMem = CreateCompatibleDC(hdc);
     HBITMAP hOldBmp = (HBITMAP)SelectObject(hdcMem, g_app.hPageBitmap);
 
-    BitBlt(hdc, page_x, page_y, g_app.page_bmp_w, g_app.page_bmp_h,
-           hdcMem, 0, 0, SRCCOPY);
+    if (dw != g_app.page_bmp_w || dh != g_app.page_bmp_h) {
+        /* Oversampled: downscale with high-quality interpolation */
+        SetStretchBltMode(hdc, HALFTONE);
+        SetBrushOrgEx(hdc, 0, 0, NULL);
+        StretchBlt(hdc, page_x, page_y, dw, dh,
+                   hdcMem, 0, 0, g_app.page_bmp_w, g_app.page_bmp_h, SRCCOPY);
+    } else {
+        BitBlt(hdc, page_x, page_y, dw, dh,
+               hdcMem, 0, 0, SRCCOPY);
+    }
 
     SelectObject(hdcMem, hOldBmp);
     DeleteDC(hdcMem);
