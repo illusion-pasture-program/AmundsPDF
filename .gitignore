@@ -22,5 +22,6 @@ test_pdfs/
 __pycache__/
 *.pyc
 
-# Generated
+# Build / generated
+build.py
 generate_icon.py
