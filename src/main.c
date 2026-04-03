@@ -299,7 +299,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR lpCmd, int nSho
     wc.style         = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc   = WndProc;
     wc.hInstance      = hInstance;
-    wc.hIcon          = LoadIconW(NULL, IDI_APPLICATION);
+    wc.hIcon          = LoadIconW(hInstance, MAKEINTRESOURCEW(1));
     wc.hIconSm        = wc.hIcon;
     wc.hCursor        = LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground  = g_app.hBgBrush;

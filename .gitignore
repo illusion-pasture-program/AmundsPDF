@@ -1,0 +1,26 @@
+# Build output
+*.exe
+*.o
+*.obj
+
+# Test artifacts
+*.bmp
+*.png
+*.svg
+diff_output/
+t1_debug_one.txt
+test_raster.c
+test_pdfs/
+
+# IDE / tools
+.claude/
+.vscode/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+
+# Generated
+generate_icon.py
