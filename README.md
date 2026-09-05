@@ -4,7 +4,7 @@ A zero-dependency PDF viewer for Windows, built from scratch in C.
 
 No libraries. No frameworks. No zlib, no freetype, no libpng. Just the PDF spec, the Win32 API, and ~21,000 lines of C.
 
-The final binary is **110 KB**.
+The binary is **279 KB**, or **110 KB** if you UPX-pack it.
 
 ## What it does
 
@@ -37,11 +37,19 @@ Opens and renders PDF documents with full anti-aliased output. Handles the real-
 
 ## Building
 
-Requires MinGW GCC on Windows.
+Requires MinGW-w64 GCC on Windows. Nothing else.
 
 ```
-python build.py
+python build.py             release  -> build/AmundsPDF.exe
+python build.py --debug     symbols, console output
+python build.py --run F.pdf build, then open F.pdf
+python build.py --pack      release, then UPX-compress it
 ```
+
+`--pack` needs [UPX](https://upx.github.io/) on PATH. It roughly halves the
+binary; the releases here are shipped unpacked, because packers trip
+antivirus heuristics and that is a bad trade for something people download
+and run.
 
 ## Architecture
 

@@ -23,5 +23,5 @@ __pycache__/
 *.pyc
 
 # Build / generated
-build.py
+build/
 generate_icon.py
